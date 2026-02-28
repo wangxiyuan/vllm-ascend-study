@@ -1,0 +1,278 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>04 - Attention 规范 - NPUWorker::get_kv_cache_spec</title>
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/styles/github-dark.min.css">
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/highlight.min.js"></script>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/languages/python.min.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/mermaid@10/dist/mermaid.min.js"></script>
+    <link rel="stylesheet" href="../styles.css">
+</head>
+<body>
+    <div class="container">
+        <nav class="sidebar">
+            <a href="../index.html" class="back-to-home">← 返回主页</a>
+            <div class="sidebar-header">
+                <h1>NPUWorker::get_kv_cache_spec</h1>
+                <p>KV Cache 规范获取流程分析</p>
+            </div>
+            <div class="nav-section">
+                <div class="nav-section-title">文档目录</div>
+                <a href="index.html" class="nav-item"><span class="nav-item-number">00</span>概述</a>
+                <a href="01-entry-point.html" class="nav-item"><span class="nav-item-number">01</span>入口方法</a>
+                <a href="02-model-runner.html" class="nav-item"><span class="nav-item-number">02</span>ModelRunner 实现</a>
+                <a href="03-layer-discovery.html" class="nav-item"><span class="nav-item-number">03</span>层发现机制</a>
+                <a href="04-attention-spec.html" class="nav-item active"><span class="nav-item-number">04</span>Attention 规范</a>
+                <a href="05-mla-mamba-spec.html" class="nav-item"><span class="nav-item-number">05</span>MLA 与 Mamba 规范</a>
+                <a href="06-data-structures.html" class="nav-item"><span class="nav-item-number">06</span>数据结构定义</a>
+                <a href="07-summary.html" class="nav-item"><span class="nav-item-number">07</span>流程总结</a>
+            </div>
+        </nav>
+
+        <main class="main-content">
+            <h1>第四章：Attention 规范生成</h1>
+
+            <h2>Attention.get_kv_cache_spec 方法</h2>
+            <div class="file-location">vllm/vllm/model_executor/layers/attention/attention.py:519</div>
+
+            <pre><code class="language-python">def get_kv_cache_spec(self, vllm_config: VllmConfig) -> KVCacheSpec:
+    # Block size may get updated after model loading, refresh it
+    block_size = vllm_config.cache_config.block_size
+    # Should not be called for enc-dec or encoder-only attention.
+    assert self.attn_type == AttentionType.DECODER
+    if self.sliding_window is not None:
+        assert not vllm_config.model_config.use_mla, (
+            "MLA is not supported for slidingwindow"
+        )
+        return SlidingWindowSpec(
+            block_size=block_size,
+            num_kv_heads=self.num_kv_heads,
+            head_size=self.head_size,
+            dtype=self.kv_cache_torch_dtype,
+            sliding_window=self.sliding_window,
+        )
+    else:
+        return FullAttentionSpec(
+            block_size=block_size,
+            num_kv_heads=self.num_kv_heads,
+            head_size=self.head_size,
+            head_size_v=self.head_size_v,
+            dtype=self.kv_cache_torch_dtype,
+        )</code></pre>
+
+            <h2>方法逻辑分析</h2>
+
+            <h3>1. 获取块大小</h3>
+            <pre><code class="language-python">block_size = vllm_config.cache_config.block_size</code></pre>
+            <p>
+                从配置中获取 KV Cache 的块大小。块大小决定了每个 KV Cache 块可以存储多少个 token 的 KV 数据。
+                常见值为 16 或 64。
+            </p>
+
+            <h3>2. 类型断言</h3>
+            <pre><code class="language-python">assert self.attn_type == AttentionType.DECODER</code></pre>
+            <p>
+                断言当前层是解码器注意力类型。编码器-解码器模型中的编码器注意力或仅编码器注意力
+                不应该调用此方法，因为它们不需要 KV Cache。
+            </p>
+
+            <h3>3. 规范类型选择</h3>
+
+            <div class="diagram">                +-------------------------+
+                | Attention.get_kv_cache_spec |
+                +-------------------------+
+                           |
+                           v
+                +-------------------------+
+                | sliding_window != None? |
+                +-------------------------+
+                    |              |
+                   Yes            No
+                    |              |
+                    v              v
+         +----------------+  +-------------------+
+         |SlidingWindowSpec| |FullAttentionSpec  |
+         +----------------+  +-------------------+
+                    |              |
+                    v              v
+         +----------------+  +-------------------+
+         | 包含窗口大小    | | 标准 KV Cache     |
+         | 参数           | | 规范             |
+         +----------------+  +-------------------+</div>
+
+            <h2>FullAttentionSpec 详解</h2>
+
+            <p>标准全注意力规范，适用于大多数 Transformer 模型：</p>
+
+            <pre><code class="language-python">@dataclass(frozen=True, kw_only=True)
+class FullAttentionSpec(AttentionSpec):
+    """
+    When hybrid allocator is disabled and the model contains both full
+    attention layers and sliding window attention layers, sliding
+    window attention are regarded as full attention in KV cache manager
+    (blocks are allocated for all tokens), while computed as sliding window
+    attention in model runner.
+    In this case, we use FullAttentionSpec and record the sliding window size.
+    """
+
+    head_size_v: int = None  # type: ignore[assignment]
+    sliding_window: int | None = None
+    attention_chunk_size: int | None = None</code></pre>
+
+            <h3>关键属性</h3>
+
+            <table>
+                <thead>
+                    <tr>
+                        <th>属性</th>
+                        <th>类型</th>
+                        <th>描述</th>
+                    </tr>
+                </thead>
+                <tbody>
+                    <tr>
+                        <td><code>block_size</code></td>
+                        <td>int</td>
+                        <td>每个块的 token 数量</td>
+                    </tr>
+                    <tr>
+                        <td><code>num_kv_heads</code></td>
+                        <td>int</td>
+                        <td>KV 头数量（GQA 中可能小于 query 头数）</td>
+                    </tr>
+                    <tr>
+                        <td><code>head_size</code></td>
+                        <td>int</td>
+                        <td>Key 的头维度</td>
+                    </tr>
+                    <tr>
+                        <td><code>head_size_v</code></td>
+                        <td>int</td>
+                        <td>Value 的头维度（默认与 head_size 相同）</td>
+                    </tr>
+                    <tr>
+                        <td><code>dtype</code></td>
+                        <td>torch.dtype</td>
+                        <td>KV Cache 的数据类型</td>
+                    </tr>
+                </tbody>
+            </table>
+
+            <h3>内存计算</h3>
+
+            <pre><code class="language-python">def max_memory_usage_bytes(self, vllm_config: VllmConfig) -> int:
+    max_model_len = vllm_config.model_config.max_model_len
+    dcp_world_size = vllm_config.parallel_config.decode_context_parallel_size
+    pcp_world_size = vllm_config.parallel_config.prefill_context_parallel_size
+    # Note(hc): each dcp rank only need save
+    # (max_model_len//dcp_world_size) tokens locally.
+    if dcp_world_size * pcp_world_size > 1:
+        max_model_len = cdiv(max_model_len, dcp_world_size * pcp_world_size)
+    return cdiv(max_model_len, self.block_size) * self.page_size_bytes</code></pre>
+
+            <p>
+                内存使用量计算考虑了解码上下文并行（DCP）和预填充上下文并行（PCP）的影响。
+                在并行场景下，每个 rank 只需要保存部分 token 的 KV Cache。
+            </p>
+
+            <h2>SlidingWindowSpec 详解</h2>
+
+            <p>滑动窗口注意力规范，适用于 Mistral 等使用滑动窗口注意力的模型：</p>
+
+            <pre><code class="language-python">@dataclass(frozen=True, kw_only=True)
+class SlidingWindowSpec(AttentionSpec):
+    sliding_window: int
+
+    def max_memory_usage_bytes(self, vllm_config: VllmConfig) -> int:
+        assert vllm_config.parallel_config.decode_context_parallel_size == 1, (
+            "DCP not support sliding window."
+        )
+        max_model_len = vllm_config.model_config.max_model_len
+        max_num_batched_tokens = vllm_config.scheduler_config.max_num_batched_tokens
+
+        # During chunked prefill, we allocate KV cache for the last
+        # `self.sliding_window-1` computed tokens plus the newly scheduled
+        # tokens. And we won't allocate KV cache for more than `max_model_len`
+        # tokens.
+        num_tokens = min(
+            self.sliding_window - 1 + max_num_batched_tokens, max_model_len
+        )
+
+        # +1 here because the sliding window may not start from the beginning
+        # of the block. For example, if the block size is 4 and num_token
+        # is 4, we need two blocks [XXCD] [EF] to store the sliding
+        # window [CDEF] of 6 tokens.
+        return (cdiv(num_tokens, self.block_size) + 1) * self.page_size_bytes</code></pre>
+
+            <div class="highlight-box">
+                <h4>滑动窗口内存优化</h4>
+                <p>
+                    滑动窗口注意力不需要缓存所有历史 token，只需要缓存最近的 <code>sliding_window</code> 个 token。
+                    这大大减少了 KV Cache 的内存占用，特别是对于长上下文场景。
+                </p>
+            </div>
+
+            <h2>page_size_bytes 计算</h2>
+
+            <pre><code class="language-python">@property
+def page_size_bytes(self) -> int:
+    return (
+        self.block_size
+        * self.num_kv_heads
+        * (self.head_size + self.head_size_v)
+        * get_dtype_size(self.dtype)
+    )</code></pre>
+
+            <p>
+                一个页面（块）的字节大小计算：
+            </p>
+            <ul>
+                <li><code>block_size</code>: 每个 block 的 token 数</li>
+                <li><code>num_kv_heads</code>: KV 头数</li>
+                <li><code>head_size + head_size_v</code>: Key 和 Value 的维度之和</li>
+                <li><code>get_dtype_size(dtype)</code>: 每个元素的字节数</li>
+            </ul>
+
+            <div class="mermaid">
+            graph LR
+                A[block_size] --> E[page_size_bytes]
+                B[num_kv_heads] --> E
+                C[head_size] --> E
+                D[head_size_v] --> E
+                F[dtype] --> E
+            </div>
+
+            <div class="chapter-nav">
+                <a href="03-layer-discovery.html" class="prev-chapter">
+                    <span class="nav-label">上一章</span>
+                    <span class="nav-title">← 层发现机制</span>
+                </a>
+                <a href="05-mla-mamba-spec.html" class="next-chapter">
+                    <span class="nav-label">下一章</span>
+                    <span class="nav-title">MLA 与 Mamba 规范 →</span>
+                </a>
+            </div>
+        </main>
+    </div>
+
+    <script>
+        hljs.highlightAll();
+        mermaid.initialize({
+            startOnLoad: true,
+            theme: 'dark',
+            themeVariables: {
+                darkMode: true,
+                background: '#161b22',
+                primaryColor: '#58a6ff',
+                primaryTextColor: '#c9d1d9',
+                primaryBorderColor: '#30363d',
+                lineColor: '#8b949e',
+                secondaryColor: '#21262d',
+                tertiaryColor: '#161b22'
+            }
+        });
+    </script>
+</body>
+</html>

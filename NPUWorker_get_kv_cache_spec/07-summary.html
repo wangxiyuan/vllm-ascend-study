@@ -1,0 +1,294 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>07 - 流程总结 - NPUWorker::get_kv_cache_spec</title>
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/styles/github-dark.min.css">
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/highlight.min.js"></script>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/languages/python.min.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/mermaid@10/dist/mermaid.min.js"></script>
+    <link rel="stylesheet" href="../styles.css">
+</head>
+<body>
+    <div class="container">
+        <nav class="sidebar">
+            <a href="../index.html" class="back-to-home">← 返回主页</a>
+            <div class="sidebar-header">
+                <h1>NPUWorker::get_kv_cache_spec</h1>
+                <p>KV Cache 规范获取流程分析</p>
+            </div>
+            <div class="nav-section">
+                <div class="nav-section-title">文档目录</div>
+                <a href="index.html" class="nav-item"><span class="nav-item-number">00</span>概述</a>
+                <a href="01-entry-point.html" class="nav-item"><span class="nav-item-number">01</span>入口方法</a>
+                <a href="02-model-runner.html" class="nav-item"><span class="nav-item-number">02</span>ModelRunner 实现</a>
+                <a href="03-layer-discovery.html" class="nav-item"><span class="nav-item-number">03</span>层发现机制</a>
+                <a href="04-attention-spec.html" class="nav-item"><span class="nav-item-number">04</span>Attention 规范</a>
+                <a href="05-mla-mamba-spec.html" class="nav-item"><span class="nav-item-number">05</span>MLA 与 Mamba 规范</a>
+                <a href="06-data-structures.html" class="nav-item"><span class="nav-item-number">06</span>数据结构定义</a>
+                <a href="07-summary.html" class="nav-item active"><span class="nav-item-number">07</span>流程总结</a>
+            </div>
+        </nav>
+
+        <main class="main-content">
+            <h1>第七章：流程总结</h1>
+
+            <h2>完整调用链</h2>
+
+            <div class="mermaid">
+            sequenceDiagram
+                participant Engine as EngineCore
+                participant Worker as NPUWorker
+                participant Runner as NPUModelRunner
+                participant Config as VllmConfig
+                participant Context as static_forward_context
+                participant Layer as AttentionLayerBase
+
+                Engine->>Worker: get_kv_cache_spec()
+                Worker->>Runner: get_kv_cache_spec()
+
+                Runner->>Runner: 检查 EC Transfer
+                alt is_producer
+                    Runner-->>Engine: 返回空字典
+                else 非 producer
+                    Runner->>Config: 获取 compilation_config
+                    Config->>Context: static_forward_context
+                    Context-->>Runner: 层名列表
+
+                    loop 每个层
+                        Runner->>Context: 获取层对象
+                        Context->>Layer: 返回层实例
+
+                        alt Attention 类型
+                            Layer->>Layer: get_kv_cache_spec()
+                            Layer-->>Runner: FullAttentionSpec/SlidingWindowSpec
+                        else MLAAttention 类型
+                            Layer->>Layer: get_kv_cache_spec()
+                            Layer-->>Runner: MLAAttentionSpec
+                        else MambaBase 类型
+                            Layer->>Layer: get_kv_cache_spec()
+                            Layer-->>Runner: MambaSpec
+                        end
+                    end
+
+                    Runner-->>Worker: dict[str, KVCacheSpec]
+                    Worker-->>Engine: dict[str, KVCacheSpec]
+                end
+            </div>
+
+            <h2>关键组件职责</h2>
+
+            <table>
+                <thead>
+                    <tr>
+                        <th>组件</th>
+                        <th>职责</th>
+                        <th>关键方法</th>
+                    </tr>
+                </thead>
+                <tbody>
+                    <tr>
+                        <td><code>NPUWorker</code></td>
+                        <td>Worker 级协调</td>
+                        <td><code>get_kv_cache_spec()</code> - 委托调用</td>
+                    </tr>
+                    <tr>
+                        <td><code>NPUModelRunner</code></td>
+                        <td>模型执行和状态管理</td>
+                        <td><code>get_kv_cache_spec()</code> - 核心逻辑</td>
+                    </tr>
+                    <tr>
+                        <td><code>get_layers_from_vllm_config</code></td>
+                        <td>层发现工具函数</td>
+                        <td>从静态上下文中提取层</td>
+                    </tr>
+                    <tr>
+                        <td><code>Attention</code></td>
+                        <td>标准注意力层</td>
+                        <td><code>get_kv_cache_spec()</code> - 返回 FullAttentionSpec</td>
+                    </tr>
+                    <tr>
+                        <td><code>MLAAttention</code></td>
+                        <td>MLA 注意力层</td>
+                        <td><code>get_kv_cache_spec()</code> - 返回 MLAAttentionSpec</td>
+                    </tr>
+                    <tr>
+                        <td><code>MambaBase</code></td>
+                        <td>Mamba SSM 层</td>
+                        <td><code>get_kv_cache_spec()</code> - 返回 MambaSpec</td>
+                    </tr>
+                </tbody>
+            </table>
+
+            <h2>返回值结构</h2>
+
+            <pre><code class="language-python"># 典型返回值结构
+{
+    # 标准 Transformer 层
+    "model.layers.0.self_attn": FullAttentionSpec(
+        block_size=16,
+        num_kv_heads=32,
+        head_size=128,
+        head_size_v=128,
+        dtype=torch.bfloat16,
+    ),
+    "model.layers.1.self_attn": FullAttentionSpec(...),
+
+    # MLA 层 (如 DeepSeek)
+    "model.layers.0.self_attn": MLAAttentionSpec(
+        block_size=16,
+        num_kv_heads=1,  # MLA 特有
+        head_size=512,   # kv_lora_rank
+        dtype=torch.bfloat16,
+    ),
+
+    # Mamba 层
+    "model.layers.0.mamba": MambaSpec(
+        block_size=1,
+        shapes=((16, 4096), (4096, 256)),  # conv_state, ssm_state
+        dtypes=(torch.float16, torch.float16),
+    ),
+}</code></pre>
+
+            <h2>设计模式总结</h2>
+
+            <h3>1. 委托模式 (Delegation Pattern)</h3>
+            <p>
+                <code>NPUWorker</code> 将具体的规范计算工作委托给 <code>NPUModelRunner</code>，
+                保持 Worker 的轻量级。
+            </p>
+
+            <h3>2. 模板方法模式 (Template Method Pattern)</h3>
+            <p>
+                <code>AttentionLayerBase</code> 定义了抽象方法 <code>get_kv_cache_spec</code>，
+                各具体层类实现各自的版本。
+            </p>
+
+            <h3>3. 策略模式 (Strategy Pattern)</h3>
+            <p>
+                不同类型的层（Attention、MLA、Mamba）使用不同的策略生成 KV Cache 规范。
+            </p>
+
+            <h2>内存优化策略</h2>
+
+            <div class="diagram">+--------------------------------------------------+
+|                  KV Cache 内存优化策略            |
++--------------------------------------------------+
+|                                                  |
+|  1. GQA (Grouped Query Attention)               |
+|     - num_kv_heads < num_heads                   |
+|     - 减少 KV Cache 大小                         |
+|                                                  |
+|  2. MLA (Multi-Latent Attention)                |
+|     - KV 压缩到低秩空间                          |
+|     - 大幅减少内存占用                           |
+|                                                  |
+|  3. Sliding Window Attention                    |
+|     - 只缓存窗口内的 token                       |
+|     - 适用于长上下文                             |
+|                                                  |
+|  4. Mamba/SSM                                    |
+|     - 固定大小的状态                             |
+|     - 与序列长度无关                             |
+|                                                  |
++--------------------------------------------------+</div>
+
+            <h2>Ascend 特定优化</h2>
+
+            <div class="ascend-specific">
+                <h4>Ascend 平台优化点</h4>
+                <ul>
+                    <li><strong>Sparse MLA</strong>：针对 DeepSeek 模型的 Sparse 模式特殊处理</li>
+                    <li><strong>ACL Graph</strong>：支持 ACL Graph 加速</li>
+                    <li><strong>内存对齐</strong>：通过 <code>page_size_padded</code> 支持内存对齐优化</li>
+                </ul>
+            </div>
+
+            <h2>关键文件索引</h2>
+
+            <table>
+                <thead>
+                    <tr>
+                        <th>文件</th>
+                        <th>路径</th>
+                        <th>主要内容</th>
+                    </tr>
+                </thead>
+                <tbody>
+                    <tr>
+                        <td>worker.py</td>
+                        <td>vllm_ascend/worker/worker.py</td>
+                        <td>NPUWorker 入口方法</td>
+                    </tr>
+                    <tr>
+                        <td>model_runner_v1.py</td>
+                        <td>vllm_ascend/worker/model_runner_v1.py</td>
+                        <td>NPUModelRunner 核心逻辑</td>
+                    </tr>
+                    <tr>
+                        <td>attention.py</td>
+                        <td>vllm/model_executor/layers/attention/attention.py</td>
+                        <td>Attention 规范生成</td>
+                    </tr>
+                    <tr>
+                        <td>mla_attention.py</td>
+                        <td>vllm/model_executor/layers/attention/mla_attention.py</td>
+                        <td>MLA 规范生成</td>
+                    </tr>
+                    <tr>
+                        <td>abstract.py</td>
+                        <td>vllm/model_executor/layers/mamba/abstract.py</td>
+                        <td>Mamba 规范生成</td>
+                    </tr>
+                    <tr>
+                        <td>kv_cache_interface.py</td>
+                        <td>vllm/v1/kv_cache_interface.py</td>
+                        <td>KVCacheSpec 数据结构</td>
+                    </tr>
+                    <tr>
+                        <td>vllm.py</td>
+                        <td>vllm/config/vllm.py</td>
+                        <td>层发现工具函数</td>
+                    </tr>
+                </tbody>
+            </table>
+
+            <div class="highlight-box">
+                <h4>总结</h4>
+                <p>
+                    <code>get_kv_cache_spec</code> 方法是 vLLM 内存管理的核心环节，
+                    它通过遍历模型中的注意力类层，收集各层的 KV Cache 规范，
+                    为后续的内存分配和 KV Cache 初始化提供依据。
+                    理解这个流程对于优化 vLLM 的内存使用和支持新的模型架构至关重要。
+                </p>
+            </div>
+
+            <div class="chapter-nav">
+                <a href="06-data-structures.html" class="prev-chapter">
+                    <span class="nav-label">上一章</span>
+                    <span class="nav-title">← 数据结构定义</span>
+                </a>
+            </div>
+        </main>
+    </div>
+
+    <script>
+        hljs.highlightAll();
+        mermaid.initialize({
+            startOnLoad: true,
+            theme: 'dark',
+            themeVariables: {
+                darkMode: true,
+                background: '#161b22',
+                primaryColor: '#58a6ff',
+                primaryTextColor: '#c9d1d9',
+                primaryBorderColor: '#30363d',
+                lineColor: '#8b949e',
+                secondaryColor: '#21262d',
+                tertiaryColor: '#161b22'
+            }
+        });
+    </script>
+</body>
+</html>

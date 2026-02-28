@@ -1,0 +1,363 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>02 - execute_model 主方法 - NPUModelRunner 代码分析</title>
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/styles/github-dark.min.css">
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/highlight.min.js"></script>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/languages/python.min.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/mermaid@10/dist/mermaid.min.js"></script>
+    <link rel="stylesheet" href="../styles.css">
+</head>
+<body>
+    <div class="container">
+        <nav class="sidebar">
+            <a href="../index.html" class="back-to-home">← 返回主页</a>
+            <div class="sidebar-header">
+                <h1>NPUModelRunner 代码分析</h1>
+                <p>execute_model 方法详解</p>
+            </div>
+            <div class="nav-section">
+                <div class="nav-section-title">文档目录</div>
+                <a href="index.html" class="nav-item"><span class="nav-item-number">00</span>概述</a>
+                <a href="01-class-overview.html" class="nav-item"><span class="nav-item-number">01</span>类结构与初始化</a>
+                <a href="02-execute-model.html" class="nav-item active"><span class="nav-item-number">02</span>execute_model 主方法</a>
+                <a href="03-update-states.html" class="nav-item"><span class="nav-item-number">03</span>_update_states 状态更新</a>
+                <a href="04-prepare-inputs.html" class="nav-item"><span class="nav-item-number">04</span>_prepare_inputs 输入准备</a>
+                <a href="05-attention-metadata.html" class="nav-item"><span class="nav-item-number">05</span>_build_attention_metadata</a>
+                <a href="06-model-forward.html" class="nav-item"><span class="nav-item-number">06</span>_model_forward 模型前向</a>
+                <a href="07-sample-tokens.html" class="nav-item"><span class="nav-item-number">07</span>sample_tokens 采样</a>
+                <a href="08-summary.html" class="nav-item"><span class="nav-item-number">08</span>完整流程总结</a>
+            </div>
+        </nav>
+
+        <main class="main-content">
+            <h1>02 - execute_model 主方法</h1>
+
+            <div class="file-location">vllm_ascend/worker/model_runner_v1.py:1060-1349</div>
+
+            <h2 id="方法签名">方法签名</h2>
+            <pre><code class="language-python">@torch.inference_mode()
+def execute_model(
+    self,
+    scheduler_output: "SchedulerOutput",
+    intermediate_tensors: IntermediateTensors | None = None,
+) -> ModelRunnerOutput | IntermediateTensors | None:</code></pre>
+
+            <h2 id="参数说明">参数说明</h2>
+            <table>
+                <thead>
+                    <tr>
+                        <th>参数</th>
+                        <th>类型</th>
+                        <th>说明</th>
+                    </tr>
+                </thead>
+                <tbody>
+                    <tr>
+                        <td><code>scheduler_output</code></td>
+                        <td><code>SchedulerOutput</code></td>
+                        <td>调度器输出，包含调度的请求、令牌数、KV 缓存块等信息</td>
+                    </tr>
+                    <tr>
+                        <td><code>intermediate_tensors</code></td>
+                        <td><code>IntermediateTensors | None</code></td>
+                        <td>流水线并行时的中间张量，非首阶段使用</td>
+                    </tr>
+                </tbody>
+            </table>
+
+            <h2 id="返回值">返回值</h2>
+            <table>
+                <thead>
+                    <tr>
+                        <th>返回类型</th>
+                        <th>场景</th>
+                    </tr>
+                </thead>
+                <tbody>
+                    <tr>
+                        <td><code>None</code></td>
+                        <td>正常执行完成，状态保存在 <code>execute_model_state</code> 中，等待 <code>sample_tokens</code> 调用</td>
+                    </tr>
+                    <tr>
+                        <td><code>IntermediateTensors</code></td>
+                        <td>流水线并行的非最后阶段，返回中间张量给下一阶段</td>
+                    </tr>
+                    <tr>
+                        <td><code>ModelRunnerOutput</code></td>
+                        <td>无令牌调度时的空输出</td>
+                    </tr>
+                </tbody>
+            </table>
+
+            <h2 id="执行流程">执行流程</h2>
+
+            <h3>阶段 1: 前置检查与状态更新</h3>
+            <pre><code class="language-python"># 检查路由专家捕获器
+if self.vllm_config.model_config.enable_return_routed_experts:
+    capturer = RoutedExpertsCapturer.get_instance()
+    if capturer is not None:
+        capturer.clear_buffer()
+
+# 状态检查
+if self.execute_model_state is not None:
+    raise RuntimeError(
+        "State error: sample_tokens() must be called "
+        "after execute_model() returns None."
+    )</code></pre>
+
+            <div class="highlight-box">
+                <h4>两阶段执行模式</h4>
+                <p>
+                    <code>execute_model</code> 和 <code>sample_tokens</code> 采用两阶段执行模式：
+                </p>
+                <ol>
+                    <li><code>execute_model</code> 完成模型前向传播，返回 <code>None</code></li>
+                    <li><code>sample_tokens</code> 完成采样，返回最终输出</li>
+                </ol>
+                <p>这种设计允许异步调度在模型执行期间并行处理采样。</p>
+            </div>
+
+            <h3>阶段 2: 输入准备阶段</h3>
+            <pre><code class="language-python">with record_function_or_nullcontext("prepare input"):
+    with self.synchronize_input_prep():
+        # 更新持久批状态
+        self._update_states(scheduler_output)
+
+        # 检查是否有编码器传输
+        if has_ec_transfer() and get_ec_transfer().is_producer:
+            with self.maybe_get_ec_connector_output(...) as ec_connector_output:
+                self._execute_mm_encoder(scheduler_output)
+                return make_empty_encoder_model_runner_output(scheduler_output)
+
+        # 检查是否有令牌调度
+        if not num_scheduled_tokens:
+            if self.parallel_config.distributed_executor_backend == "external_launcher":
+                self._dummy_run(1)  # 外部启动器需要同步
+            if not has_kv_transfer_group():
+                return EMPTY_MODEL_RUNNER_OUTPUT
+            return self.kv_connector_no_forward(scheduler_output, self.vllm_config)</code></pre>
+
+            <h3>阶段 3: 批次描述与填充</h3>
+            <pre><code class="language-python"># 计算调度令牌数
+num_scheduled_tokens = scheduler_output.total_num_scheduled_tokens
+tokens = [scheduler_output.num_scheduled_tokens[i] for i in req_ids]
+num_scheduled_tokens_np = np.array(tokens, dtype=np.int32)
+max_num_scheduled_tokens = int(num_scheduled_tokens_np.max())
+
+# 准备输入
+logits_indices, spec_decode_metadata = self._prepare_inputs(
+    scheduler_output, num_scheduled_tokens_np
+)
+
+# 确定批次执行模式和填充
+cudagraph_mode, batch_desc, should_ubatch, num_tokens_across_dp, cudagraph_stats = \
+    self._determine_batch_execution_and_padding(
+        num_tokens=num_tokens_unpadded,
+        num_reqs=num_reqs,
+        num_scheduled_tokens_np=num_scheduled_tokens_np,
+        max_num_scheduled_tokens=max_num_scheduled_tokens,
+        use_cascade_attn=cascade_attn_prefix_lens is not None,
+        num_encoder_reqs=len(scheduler_output.scheduled_encoder_inputs),
+    )</code></pre>
+
+            <h3>阶段 4: 构建注意力元数据</h3>
+            <pre><code class="language-python">attn_metadata, spec_decode_common_attn_metadata = \
+    self._build_attention_metadata(
+        num_tokens=num_tokens_unpadded,
+        num_tokens_padded=num_tokens_padded,
+        num_reqs=num_reqs,
+        num_reqs_padded=num_reqs_padded,
+        max_query_len=max_num_scheduled_tokens,
+        ubatch_slices=ubatch_slices_attn,
+        logits_indices=logits_indices,
+        use_spec_decode=use_spec_decode,
+        num_scheduled_tokens=scheduler_output.num_scheduled_tokens,
+        num_scheduled_tokens_np=num_scheduled_tokens_np,
+        cascade_attn_prefix_lens=cascade_attn_prefix_lens,
+    )</code></pre>
+
+            <h3>阶段 5: 预处理</h3>
+            <pre><code class="language-python">(
+    input_ids,
+    inputs_embeds,
+    positions,
+    intermediate_tensors,
+    model_kwargs,
+    ec_connector_output,
+) = self._preprocess(scheduler_output, num_tokens_padded, intermediate_tensors)
+
+# 更新全局 cos, sin (Rotary Embedding)
+update_cos_sin(positions)</code></pre>
+
+            <h3>阶段 6: 模型前向传播</h3>
+            <pre><code class="language-python">with (
+    record_function_or_nullcontext("forward"),
+    set_ascend_forward_context(
+        attn_metadata,
+        self.vllm_config,
+        num_tokens=num_tokens_padded,
+        num_tokens_across_dp=num_tokens_across_dp,
+        aclgraph_runtime_mode=cudagraph_mode,
+        batch_descriptor=batch_desc,
+        num_actual_tokens=scheduler_output.total_num_scheduled_tokens,
+        model_instance=self.model,
+        skip_compiled=has_encoder_input,
+    ),
+    self.maybe_get_kv_connector_output(scheduler_output) as kv_connector_output,
+):
+    hidden_states = self._model_forward(
+        num_tokens_padded, input_ids, positions,
+        intermediate_tensors, inputs_embeds, **model_kwargs
+    )</code></pre>
+
+            <div class="ascend-specific">
+                <h4>set_ascend_forward_context</h4>
+                <p>
+                    这是 Ascend 特有的上下文管理器，用于设置前向传播所需的 Ascend 特定参数，
+                    包括 ACL Graph 模式、批次描述符、MoE 通信方法等。
+                </p>
+            </div>
+
+            <h3>阶段 7: 后处理与状态保存</h3>
+            <pre><code class="language-python"># 处理 PCP (Prefill Context Parallel)
+if self.pcp_size > 1:
+    hidden_states = self.pcp_manager.get_restore_hidden_states(hidden_states)
+
+# 非最后 PP 阶段
+if not self.broadcast_pp_output:
+    if not get_pp_group().is_last_rank:
+        assert isinstance(hidden_states, IntermediateTensors)
+        hidden_states.kv_connector_output = kv_connector_output
+        return hidden_states
+
+    # Pooling 模型
+    if self.is_pooling_model:
+        output = self._pool(hidden_states, ...)
+        return output
+
+    # 计算 logits
+    sample_hidden_states = hidden_states[logits_indices]
+    logits = self.model.compute_logits(sample_hidden_states)
+
+# 保存状态供 sample_tokens 使用
+self.execute_model_state = ExecuteModelState(
+    scheduler_output,
+    logits,
+    spec_decode_metadata,
+    spec_decode_common_attn_metadata,
+    hidden_states,
+    sample_hidden_states,
+    aux_hidden_states,
+    attn_metadata,
+    positions,
+    ec_connector_output,
+    cudagraph_stats,
+)
+self.kv_connector_output = kv_connector_output
+
+return None</code></pre>
+
+            <h2 id="流程图">流程图</h2>
+            <div class="mermaid">
+flowchart TD
+    subgraph "前置检查"
+        A1[检查路由专家捕获器] --> A2[检查执行状态]
+        A2 --> A3[异步调度处理]
+    end
+
+    subgraph "输入准备"
+        B1[_update_states] --> B2[检查 EC Transfer]
+        B2 --> B3[检查令牌数]
+        B3 --> B4[_prepare_inputs]
+        B4 --> B5[确定批次模式]
+        B5 --> B6[_build_attention_metadata]
+        B6 --> B7[_preprocess]
+    end
+
+    subgraph "模型执行"
+        C1[设置 Ascend 上下文] --> C2[_model_forward]
+        C2 --> C3{PCP 启用?}
+        C3 -->|是| C4[恢复隐藏状态]
+        C3 -->|否| C5[直接使用]
+        C4 --> C6{最后 PP 阶段?}
+        C5 --> C6
+    end
+
+    subgraph "结果处理"
+        D1{最后 PP 阶段?} -->|否| D2[返回 IntermediateTensors]
+        D1 -->|是| D3{Pooling 模型?}
+        D3 -->|是| D4[返回 Pooling 输出]
+        D3 -->|否| D5[计算 logits]
+        D5 --> D6[保存执行状态]
+        D6 --> D7[返回 None]
+    end
+
+    A3 --> B1
+    B7 --> C1
+    C6 --> D1
+            </div>
+
+            <h2 id="cuda-graph-模式">CUDA Graph 模式</h2>
+            <p><code>_determine_batch_execution_and_padding</code> 方法会根据批次特征确定 CUDA Graph 模式：</p>
+            <table>
+                <thead>
+                    <tr>
+                        <th>模式</th>
+                        <th>说明</th>
+                    </tr>
+                </thead>
+                <tbody>
+                    <tr>
+                        <td><code>NONE</code></td>
+                        <td>不使用 CUDA Graph，eager 模式执行</td>
+                    </tr>
+                    <tr>
+                        <td><code>PIECEWISE</code></td>
+                        <td>部分 CUDA Graph，某些内核使用图捕获</td>
+                    </tr>
+                    <tr>
+                        <td><code>FULL</code></td>
+                        <td>完整 CUDA Graph，整个前向传播使用图捕获</td>
+                    </tr>
+                </tbody>
+            </table>
+
+            <div class="chapter-nav">
+                <a href="01-class-overview.html">
+                    <div>
+                        <div class="nav-label">上一章</div>
+                        <div class="nav-title">← 类结构与初始化</div>
+                    </div>
+                </a>
+                <a href="03-update-states.html">
+                    <div>
+                        <div class="nav-label">下一章</div>
+                        <div class="nav-title">_update_states 状态更新 →</div>
+                    </div>
+                </a>
+            </div>
+        </main>
+    </div>
+
+    <script>
+        hljs.highlightAll();
+        mermaid.initialize({
+            startOnLoad: true,
+            theme: 'dark',
+            themeVariables: {
+                darkMode: true,
+                background: '#161b22',
+                primaryColor: '#58a6ff',
+                primaryTextColor: '#c9d1d9',
+                primaryBorderColor: '#30363d',
+                lineColor: '#8b949e',
+                secondaryColor: '#21262d',
+                tertiaryColor: '#161b22'
+            }
+        });
+    </script>
+</body>
+</html>

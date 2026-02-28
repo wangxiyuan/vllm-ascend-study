@@ -1,0 +1,253 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>01 - 类结构与初始化 - NPUModelRunner 代码分析</title>
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/styles/github-dark.min.css">
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/highlight.min.js"></script>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/languages/python.min.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/mermaid@10/dist/mermaid.min.js"></script>
+    <link rel="stylesheet" href="../styles.css">
+</head>
+<body>
+    <div class="container">
+        <nav class="sidebar">
+            <a href="../index.html" class="back-to-home">← 返回主页</a>
+            <div class="sidebar-header">
+                <h1>NPUModelRunner 代码分析</h1>
+                <p>execute_model 方法详解</p>
+            </div>
+            <div class="nav-section">
+                <div class="nav-section-title">文档目录</div>
+                <a href="index.html" class="nav-item"><span class="nav-item-number">00</span>概述</a>
+                <a href="01-class-overview.html" class="nav-item active"><span class="nav-item-number">01</span>类结构与初始化</a>
+                <a href="02-execute-model.html" class="nav-item"><span class="nav-item-number">02</span>execute_model 主方法</a>
+                <a href="03-update-states.html" class="nav-item"><span class="nav-item-number">03</span>_update_states 状态更新</a>
+                <a href="04-prepare-inputs.html" class="nav-item"><span class="nav-item-number">04</span>_prepare_inputs 输入准备</a>
+                <a href="05-attention-metadata.html" class="nav-item"><span class="nav-item-number">05</span>_build_attention_metadata</a>
+                <a href="06-model-forward.html" class="nav-item"><span class="nav-item-number">06</span>_model_forward 模型前向</a>
+                <a href="07-sample-tokens.html" class="nav-item"><span class="nav-item-number">07</span>sample_tokens 采样</a>
+                <a href="08-summary.html" class="nav-item"><span class="nav-item-number">08</span>完整流程总结</a>
+            </div>
+        </nav>
+
+        <main class="main-content">
+            <h1>01 - 类结构与初始化</h1>
+
+            <div class="file-location">vllm_ascend/worker/model_runner_v1.py:212-375</div>
+
+            <h2 id="类定义">类定义</h2>
+            <p><code>NPUModelRunner</code> 继承自 vLLM 的 <code>GPUModelRunner</code> 类，针对华为昇腾 NPU 进行了适配和优化。</p>
+
+            <pre><code class="language-python">class NPUModelRunner(GPUModelRunner):
+    def __init__(self, vllm_config: VllmConfig, device: torch.device):
+        # PCP 填充令牌数计算
+        max_pcp_pad_tokens = (
+            vllm_config.parallel_config.prefill_context_parallel_size
+            * 2 * vllm_config.scheduler_config.max_num_seqs
+        )
+        vllm_config.scheduler_config.max_num_batched_tokens += max_pcp_pad_tokens
+
+        # 调用父类初始化
+        with _torch_cuda_wrapper():
+            super().__init__(vllm_config, device)</code></pre>
+
+            <div class="ascend-specific">
+                <h4>Ascend 特定适配</h4>
+                <p><code>_torch_cuda_wrapper()</code> 上下文管理器用于临时将 CUDA 调用重定向到 NPU，确保父类初始化过程中的 CUDA 操作能够正确映射到昇腾设备。</p>
+            </div>
+
+            <h2 id="核心属性">核心属性</h2>
+            <table>
+                <thead>
+                    <tr>
+                        <th>属性</th>
+                        <th>类型</th>
+                        <th>说明</th>
+                    </tr>
+                </thead>
+                <tbody>
+                    <tr>
+                        <td><code>sampler</code></td>
+                        <td><code>AscendSampler</code></td>
+                        <td>Ascend 采样器实现</td>
+                    </tr>
+                    <tr>
+                        <td><code>attn_state</code></td>
+                        <td><code>AscendAttentionState</code></td>
+                        <td>注意力状态（Prefill/Decode/SpecDecoding）</td>
+                    </tr>
+                    <tr>
+                        <td><code>ascend_config</code></td>
+                        <td><code>AscendConfig</code></td>
+                        <td>Ascend 特定配置</td>
+                    </tr>
+                    <tr>
+                        <td><code>input_batch</code></td>
+                        <td><code>NPUInputBatch</code></td>
+                        <td>NPU 输入批处理数据结构</td>
+                    </tr>
+                    <tr>
+                        <td><code>pcp_manager</code></td>
+                        <td><code>PCPManager</code></td>
+                        <td>Prefill Context Parallel 管理器</td>
+                    </tr>
+                    <tr>
+                        <td><code>drafter</code></td>
+                        <td>各种 Proposer</td>
+                        <td>投机解码的 drafter 模型</td>
+                    </tr>
+                </tbody>
+            </table>
+
+            <h2 id="并行配置">并行配置</h2>
+            <pre><code class="language-python"># 数据并行
+self.dp_size = vllm_config.parallel_config.data_parallel_size
+self.dp_rank = vllm_config.parallel_config.data_parallel_rank
+
+# 上下文并行
+self.dcp_size = get_dcp_group().world_size  # Decode Context Parallel
+self.pcp_size = get_pcp_group().world_size  # Prefill Context Parallel
+
+# PCP 管理器初始化
+if self.pcp_size * self.dcp_size > 1:
+    self.pcp_manager = PCPManager(
+        self.pcp_size, self.pcp_rank,
+        self.dcp_size, self.dcp_rank,
+        max_buffer_num_tokens, self.max_num_reqs,
+        self.device, self.vllm_config,
+        self.use_async_scheduling, self.pin_memory,
+    )</code></pre>
+
+            <div class="diagram">┌─────────────────────────────────────────────────────┐
+│                    并行策略架构                      │
+├─────────────────────────────────────────────────────┤
+│  DP (Data Parallel)     - 数据并行                  │
+│  TP (Tensor Parallel)   - 张量并行                  │
+│  PP (Pipeline Parallel) - 流水线并行                │
+│  DCP (Decode CP)        - Decode 阶段上下文并行     │
+│  PCP (Prefill CP)       - Prefill 阶段上下文并行    │
+└─────────────────────────────────────────────────────┘</div>
+
+            <h2 id="注意力状态">注意力状态</h2>
+            <p><code>AscendAttentionState</code> 定义了不同的注意力计算状态，用于选择不同的内核实现：</p>
+
+            <pre><code class="language-python">class AscendAttentionState(Enum):
+    PrefillNoCache = 0     # 首次 prefill，无 KV 缓存
+    PrefillCacheHit = 1    # Prefill 有缓存命中
+    DecodeOnly = 2         # 纯 decode 阶段
+    ChunkedPrefill = 3     # 分块 prefill
+    SpecDecoding = 4       # 投机解码</code></pre>
+
+            <h2 id="投机解码配置">投机解码配置</h2>
+            <pre><code class="language-python">def _set_up_drafter(self):
+    self.drafter = None
+    if self.speculative_config:
+        spec_token_num = self.speculative_config.num_speculative_tokens
+        self.decode_token_per_req = 1 + spec_token_num
+
+        if get_pp_group().is_last_rank:
+            self.drafter = self._get_drafter()
+            # 支持多种 drafter 类型
+            # - NgramProposer: N-gram 匹配
+            # - EagleProposer: EAGLE 模型
+            # - MtpProposer: MTP 模型
+            # - MedusaProposer: Medusa 模型
+            # - SuffixDecodingProposer: 后缀解码</code></pre>
+
+            <h2 id="eplb-动态负载均衡">EPLB 动态负载均衡</h2>
+            <div class="ascend-specific">
+                <h4>Ascend 特有功能</h4>
+                <p>EPLB (Expert Parallelism Load Balancer) 是 Ascend 特有的 MoE 专家负载均衡机制：</p>
+                <pre><code class="language-python">if self.dynamic_eplb:
+    self.eplb_loader = D2DExpertWeightLoader()
+    self.shared_dict = self.manager.dict({
+        "expert_map": None,
+        "moe_load": None,
+        "expert_maps": None
+    })
+    self.eplb_process = EplbProcess(
+        shared_dict=self.shared_dict,
+        policy_type=self.policy_type,
+        enable_d2d=True
+    )
+    self.eplb_updator = EplbUpdator(...)</code></pre>
+            </div>
+
+            <h2 id="输入批处理">输入批处理</h2>
+            <pre><code class="language-python">self.input_batch = NPUInputBatch(
+    max_num_reqs=self.max_num_reqs,
+    max_model_len=max(self.model_config.max_model_len, self.max_encoder_len),
+    max_num_batched_tokens=self.max_num_tokens,
+    device=self.device,
+    pin_memory=self.pin_memory,
+    vocab_size=self.model_config.get_vocab_size(),
+    block_sizes=[self.block_size],
+    kernel_block_sizes=[[self.cache_config.block_size]],
+    is_spec_decode=bool(self.vllm_config.speculative_config),
+    logitsprocs=build_logitsprocs(...),
+    is_pooling_model=self.is_pooling_model,
+    num_speculative_tokens=...,
+    cp_kv_cache_interleave_size=self.parallel_config.cp_kv_cache_interleave_size,
+)</code></pre>
+
+            <h2 id="初始化时序图">初始化时序图</h2>
+            <div class="mermaid">
+sequenceDiagram
+    participant Config as VllmConfig
+    participant Runner as NPUModelRunner
+    participant Parent as GPUModelRunner
+    participant Batch as NPUInputBatch
+    participant PCP as PCPManager
+
+    Config->>Runner: 传入配置
+    Runner->>Runner: 计算 PCP 填充
+    Runner->>Parent: 调用父类初始化
+    Parent-->>Runner: 完成基础初始化
+    Runner->>Runner: 创建 query_start_loc 缓冲区
+    Runner->>Runner: 初始化并行配置
+    Runner->>Runner: 设置 Ascend 配置
+    Runner->>Runner: 初始化注意力后端
+    Runner->>Runner: 设置投机解码
+    Runner->>Batch: 创建输入批处理
+    Runner->>PCP: 创建 PCP 管理器 (如需要)
+    Runner->>Runner: 初始化 Rotary Embedding
+            </div>
+
+            <div class="chapter-nav">
+                <a href="index.html">
+                    <div>
+                        <div class="nav-label">上一章</div>
+                        <div class="nav-title">← 概述</div>
+                    </div>
+                </a>
+                <a href="02-execute-model.html">
+                    <div>
+                        <div class="nav-label">下一章</div>
+                        <div class="nav-title">execute_model 主方法 →</div>
+                    </div>
+                </a>
+            </div>
+        </main>
+    </div>
+
+    <script>
+        hljs.highlightAll();
+        mermaid.initialize({
+            startOnLoad: true,
+            theme: 'dark',
+            themeVariables: {
+                darkMode: true,
+                background: '#161b22',
+                primaryColor: '#58a6ff',
+                primaryTextColor: '#c9d1d9',
+                primaryBorderColor: '#30363d',
+                lineColor: '#8b949e',
+                secondaryColor: '#21262d',
+                tertiaryColor: '#161b22'
+            }
+        });
+    </script>
+</body>
+</html>

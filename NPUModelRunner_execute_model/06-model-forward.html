@@ -1,0 +1,373 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>06 - _model_forward - NPUModelRunner 代码分析</title>
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/styles/github-dark.min.css">
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/highlight.min.js"></script>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/languages/python.min.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/mermaid@10/dist/mermaid.min.js"></script>
+    <link rel="stylesheet" href="../styles.css">
+</head>
+<body>
+    <div class="container">
+        <nav class="sidebar">
+            <a href="../index.html" class="back-to-home">← 返回主页</a>
+            <div class="sidebar-header">
+                <h1>NPUModelRunner 代码分析</h1>
+                <p>execute_model 方法详解</p>
+            </div>
+            <div class="nav-section">
+                <div class="nav-section-title">文档目录</div>
+                <a href="index.html" class="nav-item"><span class="nav-item-number">00</span>概述</a>
+                <a href="01-class-overview.html" class="nav-item"><span class="nav-item-number">01</span>类结构与初始化</a>
+                <a href="02-execute-model.html" class="nav-item"><span class="nav-item-number">02</span>execute_model 主方法</a>
+                <a href="03-update-states.html" class="nav-item"><span class="nav-item-number">03</span>_update_states 状态更新</a>
+                <a href="04-prepare-inputs.html" class="nav-item"><span class="nav-item-number">04</span>_prepare_inputs 输入准备</a>
+                <a href="05-attention-metadata.html" class="nav-item"><span class="nav-item-number">05</span>_build_attention_metadata</a>
+                <a href="06-model-forward.html" class="nav-item active"><span class="nav-item-number">06</span>_model_forward 模型前向</a>
+                <a href="07-sample-tokens.html" class="nav-item"><span class="nav-item-number">07</span>sample_tokens 采样</a>
+                <a href="08-summary.html" class="nav-item"><span class="nav-item-number">08</span>完整流程总结</a>
+            </div>
+        </nav>
+
+        <main class="main-content">
+            <h1>第六章：_model_forward - 模型前向传播</h1>
+
+            <div class="file-location">vllm_ascend/worker/model_runner_v1.py:1661-1697</div>
+
+            <h2 id="方法概述">方法概述</h2>
+            <p>
+                <code>_model_forward</code> 方法是模型推理的核心执行单元，负责调用实际的模型进行前向传播。
+                该方法接收预处理后的输入张量，执行模型计算，并返回隐藏状态（hidden states）。
+            </p>
+
+            <h2 id="方法签名">方法签名</h2>
+            <pre><code class="language-python">def _model_forward(
+    self,
+    num_tokens_padded: int,                      # 填充后的 token 数量
+    input_ids: torch.Tensor | None = None,       # 输入 token ID 张量
+    positions: torch.Tensor | None = None,       # 位置编码张量
+    intermediate_tensors: IntermediateTensors | None = None,  # 中间张量（PP 场景）
+    inputs_embeds: torch.Tensor | None = None,   # 输入嵌入张量
+    **model_kwargs: dict[str, Any],              # 其他模型参数
+) -> torch.Tensor | IntermediateTensors:</code></pre>
+
+            <h2 id="执行流程">执行流程</h2>
+            <div class="mermaid">
+flowchart TD
+    A[开始 _model_forward] --> B[调用 self.model 前向传播]
+    B --> C[获取 forward_context]
+    C --> D{是否为 FULL Graph 模式?}
+    D -->|是| E[update_full_graph_params]
+    D -->|否| F{是否启用 flash_comm_v1?}
+    E --> F
+    F -->|是| G[_all_gather_hidden_states_and_aux]
+    F -->|否| H[返回 hidden_states]
+    G --> H
+            </div>
+
+            <h2 id="核心实现">核心实现</h2>
+
+            <h3>1. 模型前向传播</h3>
+            <pre><code class="language-python">def _model_forward(
+    self,
+    num_tokens_padded: int,
+    input_ids: torch.Tensor | None = None,
+    positions: torch.Tensor | None = None,
+    intermediate_tensors: IntermediateTensors | None = None,
+    inputs_embeds: torch.Tensor | None = None,
+    **model_kwargs: dict[str, Any],
+):
+    assert self.model is not None
+
+    # 调用模型进行前向传播
+    hidden_states = self.model(
+        input_ids=input_ids,
+        positions=positions,
+        intermediate_tensors=intermediate_tensors,
+        inputs_embeds=inputs_embeds,
+        **model_kwargs,
+    )</code></pre>
+
+            <h3>2. ACL Graph 参数更新</h3>
+            <div class="highlight-box">
+                <h4>ACL Graph（昇腾计算图）</h4>
+                <p>
+                    ACL Graph 是昇腾 NPU 上的计算图优化技术，类似于 CUDA Graph。
+                    在 FULL Graph 模式下运行时，需要更新图参数以确保正确执行。
+                </p>
+            </div>
+            <pre><code class="language-python">forward_context = get_forward_context()
+assert forward_context is not None
+
+if (
+    forward_context.cudagraph_runtime_mode == CUDAGraphMode.FULL
+    and not forward_context.capturing
+    and not self.use_sparse
+):
+    assert positions is not None
+    update_full_graph_params(
+        self.attn_backend,
+        self.update_stream,
+        forward_context,
+        num_tokens_padded,
+        self.vllm_config,
+        self.speculative_config,
+        positions.shape[0],
+    )</code></pre>
+
+            <h3>3. 序列并行 All-Gather</h3>
+            <p>当启用 flash_comm_v1 时，需要执行 all-gather 操作收集所有 hidden states：</p>
+            <pre><code class="language-python">if get_forward_context().flash_comm_v1_enabled and not isinstance(hidden_states, IntermediateTensors):
+    hidden_states = self._all_gather_hidden_states_and_aux(hidden_states)
+
+return hidden_states</code></pre>
+
+            <h2 id="调用上下文">调用上下文</h2>
+
+            <p><code>_model_forward</code> 在 <code>set_ascend_forward_context</code> 上下文管理器中执行：</p>
+            <pre><code class="language-python">with (
+    record_function_or_nullcontext("forward"),
+    set_ascend_forward_context(
+        attn_metadata,
+        self.vllm_config,
+        num_tokens=num_tokens_padded,
+        num_tokens_across_dp=num_tokens_across_dp,
+        aclgraph_runtime_mode=cudagraph_mode,
+        batch_descriptor=batch_desc,
+        num_actual_tokens=scheduler_output.total_num_scheduled_tokens,
+        model_instance=self.model,
+        skip_compiled=has_encoder_input,
+    ),
+    self.maybe_get_kv_connector_output(scheduler_output) as kv_connector_output,
+):
+    hidden_states = self._model_forward(
+        num_tokens_padded, input_ids, positions, intermediate_tensors, inputs_embeds, **model_kwargs
+    )</code></pre>
+
+            <h2 id="后处理流程">后处理流程</h2>
+
+            <div class="diagram">┌─────────────────────────────────────────────────────────────┐
+│                    _model_forward 返回后                     │
+├─────────────────────────────────────────────────────────────┤
+│                                                             │
+│  ┌─────────────────┐                                        │
+│  │  hidden_states  │                                        │
+│  └────────┬────────┘                                        │
+│           │                                                 │
+│           ▼                                                 │
+│  ┌─────────────────┐                                        │
+│  │ use_aux_hidden  │──是──→ 解包 hidden_states 和 aux     │
+│  │   _state_outputs│                                        │
+│  └────────┬────────┘                                        │
+│           │ 否                                              │
+│           ▼                                                 │
+│  ┌─────────────────┐                                        │
+│  │  pcp_size > 1?  │──是──→ PCP hidden states 恢复         │
+│  └────────┬────────┘                                        │
+│           │ 否                                              │
+│           ▼                                                 │
+│  ┌─────────────────┐                                        │
+│  │ is_last_rank?   │──否──→ 返回 IntermediateTensors       │
+│  └────────┬────────┘                                        │
+│           │ 是                                              │
+│           ▼                                                 │
+│  ┌─────────────────┐                                        │
+│  │ compute_logits  │                                        │
+│  └─────────────────┘                                        │
+└─────────────────────────────────────────────────────────────┘</div>
+
+            <h3>1. 辅助隐藏状态处理</h3>
+            <pre><code class="language-python">aux_hidden_states = None
+if self.use_aux_hidden_state_outputs:
+    hidden_states, aux_hidden_states = hidden_states</code></pre>
+
+            <h3>2. PCP 恢复</h3>
+            <pre><code class="language-python">if self.pcp_size > 1:
+    # PCP allgather 后需要恢复原始 hidden states 顺序
+    hidden_states = self.pcp_manager.get_restore_hidden_states(hidden_states)
+    if aux_hidden_states is not None:
+        aux_hidden_states = [
+            self.pcp_manager.get_restore_hidden_states(aux_hidden_states_pcp)
+            for aux_hidden_states_pcp in aux_hidden_states
+        ]</code></pre>
+
+            <h3>3. Logits 计算</h3>
+            <pre><code class="language-python">if not self.broadcast_pp_output:
+    # 常规情况
+    if not get_pp_group().is_last_rank:
+        # 非 last rank，返回中间张量
+        assert isinstance(hidden_states, IntermediateTensors)
+        hidden_states.kv_connector_output = kv_connector_output
+        return hidden_states
+
+    if self.is_pooling_model:
+        # Pooling 模型处理
+        output = self._pool(hidden_states, ...)
+        return output
+
+    # 计算 logits
+    sample_hidden_states = hidden_states[logits_indices]
+    logits = self.model.compute_logits(sample_hidden_states)</code></pre>
+
+            <h2 id="update_full_graph_params">update_full_graph_params 详解</h2>
+
+            <div class="file-location">vllm_ascend/compilation/acl_graph.py:213-232</div>
+
+            <pre><code class="language-python">def update_full_graph_params(
+    attn_backend,
+    update_stream,
+    forward_context,
+    num_tokens,
+    vllm_config,
+    speculative_config=None,
+    num_dcp_pcp_tokens=None,
+    draft_attn_metadatas=None,
+):
+    impl_cls = attn_backend.get_impl_cls()
+    impl_cls.update_graph_params(
+        update_stream,
+        forward_context,
+        num_tokens,
+        vllm_config,
+        speculative_config,
+        num_dcp_pcp_tokens,
+        draft_attn_metadatas,
+    )</code></pre>
+
+            <h2 id="hidden-states-处理">Hidden States All-Gather</h2>
+
+            <h3>单张量 All-Gather</h3>
+            <pre><code class="language-python">@staticmethod
+def _all_gather_hidden_states(hidden_states):
+    hidden_states = tensor_model_parallel_all_gather(hidden_states, 0)
+    pad_size = get_forward_context().pad_size
+    if pad_size > 0:
+        hidden_states = hidden_states[:-pad_size, :]
+    return hidden_states</code></pre>
+
+            <h3>多张量 All-Gather</h3>
+            <pre><code class="language-python">@staticmethod
+def _all_gather_hidden_states_and_aux(hidden_states):
+    if isinstance(hidden_states, tuple):
+        return (
+            NPUModelRunner._all_gather_hidden_states(hidden_states[0]),
+            NPUModelRunner._all_gather_hidden_states_list(hidden_states[1]),
+        )
+    return NPUModelRunner._all_gather_hidden_states(hidden_states)</code></pre>
+
+            <h2 id="数据流图">数据流图</h2>
+
+            <div class="diagram">        execute_model
+              │
+              ▼
+    ┌─────────────────────┐
+    │  _prepare_inputs    │
+    └──────────┬──────────┘
+               │
+               ▼
+    ┌─────────────────────┐
+    │_build_attention_    │
+    │     metadata        │
+    └──────────┬──────────┘
+               │
+               ▼
+    ┌─────────────────────┐
+    │ set_ascend_forward_ │
+    │      context        │
+    └──────────┬──────────┘
+               │
+               ▼
+    ┌─────────────────────┐
+    │   _model_forward    │
+    │  ┌───────────────┐  │
+    │  │  self.model   │  │
+    │  │   forward()   │  │
+    │  └───────────────┘  │
+    └──────────┬──────────┘
+               │
+               ▼
+    ┌─────────────────────┐
+    │  hidden_states 后处理 │
+    │  - PCP 恢复          │
+    │  - Logits 计算       │
+    └─────────────────────┘</div>
+
+            <h2 id="返回值">返回值</h2>
+
+            <table>
+                <thead>
+                    <tr>
+                        <th>场景</th>
+                        <th>返回类型</th>
+                        <th>说明</th>
+                    </tr>
+                </thead>
+                <tbody>
+                    <tr>
+                        <td>非 PP last rank</td>
+                        <td><code>IntermediateTensors</code></td>
+                        <td>中间张量，传递给下一 PP 阶段</td>
+                    </tr>
+                    <tr>
+                        <td>PP last rank</td>
+                        <td><code>torch.Tensor</code></td>
+                        <td>hidden_states，用于后续 logits 计算</td>
+                    </tr>
+                    <tr>
+                        <td>Pooling 模型</td>
+                        <td><code>PoolerOutput</code></td>
+                        <td>池化后的输出</td>
+                    </tr>
+                </tbody>
+            </table>
+
+            <div class="highlight-box">
+                <h4>关键点总结</h4>
+                <ul>
+                    <li><strong>模型调用</strong>：通过 <code>self.model()</code> 执行实际的前向传播</li>
+                    <li><strong>ACL Graph</strong>：FULL 模式下需要更新图参数</li>
+                    <li><strong>序列并行</strong>：启用 flash_comm_v1 时执行 all-gather</li>
+                    <li><strong>PCP 恢复</strong>：长序列并行后需要恢复 hidden states 顺序</li>
+                    <li><strong>Logits 计算</strong>：仅在 PP last rank 执行</li>
+                </ul>
+            </div>
+
+            <div class="chapter-nav">
+                <a href="05-attention-metadata.html">
+                    <div>
+                        <div class="nav-label">上一章</div>
+                        <div class="nav-title">← _build_attention_metadata</div>
+                    </div>
+                </a>
+                <a href="07-sample-tokens.html">
+                    <div>
+                        <div class="nav-label">下一章</div>
+                        <div class="nav-title">sample_tokens 采样 →</div>
+                    </div>
+                </a>
+            </div>
+        </main>
+    </div>
+
+    <script>
+        hljs.highlightAll();
+        mermaid.initialize({
+            startOnLoad: true,
+            theme: 'dark',
+            themeVariables: {
+                darkMode: true,
+                background: '#161b22',
+                primaryColor: '#58a6ff',
+                primaryTextColor: '#c9d1d9',
+                primaryBorderColor: '#30363d',
+                lineColor: '#8b949e',
+                secondaryColor: '#21262d',
+                tertiaryColor: '#161b22'
+            }
+        });
+    </script>
+</body>
+</html>

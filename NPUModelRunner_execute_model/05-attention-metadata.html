@@ -1,0 +1,369 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>05 - _build_attention_metadata - NPUModelRunner 代码分析</title>
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/styles/github-dark.min.css">
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/highlight.min.js"></script>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/languages/python.min.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/mermaid@10/dist/mermaid.min.js"></script>
+    <link rel="stylesheet" href="../styles.css">
+</head>
+<body>
+    <div class="container">
+        <nav class="sidebar">
+            <a href="../index.html" class="back-to-home">← 返回主页</a>
+            <div class="sidebar-header">
+                <h1>NPUModelRunner 代码分析</h1>
+                <p>execute_model 方法详解</p>
+            </div>
+            <div class="nav-section">
+                <div class="nav-section-title">文档目录</div>
+                <a href="index.html" class="nav-item"><span class="nav-item-number">00</span>概述</a>
+                <a href="01-class-overview.html" class="nav-item"><span class="nav-item-number">01</span>类结构与初始化</a>
+                <a href="02-execute-model.html" class="nav-item"><span class="nav-item-number">02</span>execute_model 主方法</a>
+                <a href="03-update-states.html" class="nav-item"><span class="nav-item-number">03</span>_update_states 状态更新</a>
+                <a href="04-prepare-inputs.html" class="nav-item"><span class="nav-item-number">04</span>_prepare_inputs 输入准备</a>
+                <a href="05-attention-metadata.html" class="nav-item active"><span class="nav-item-number">05</span>_build_attention_metadata</a>
+                <a href="06-model-forward.html" class="nav-item"><span class="nav-item-number">06</span>_model_forward 模型前向</a>
+                <a href="07-sample-tokens.html" class="nav-item"><span class="nav-item-number">07</span>sample_tokens 采样</a>
+                <a href="08-summary.html" class="nav-item"><span class="nav-item-number">08</span>完整流程总结</a>
+            </div>
+        </nav>
+
+        <main class="main-content">
+            <h1>第五章：_build_attention_metadata - 注意力元数据构建</h1>
+
+            <div class="file-location">vllm_ascend/worker/model_runner_v1.py:1847-2060</div>
+
+            <h2 id="方法概述">方法概述</h2>
+            <p>
+                <code>_build_attention_metadata</code> 方法是模型推理过程中至关重要的步骤，
+                负责构建注意力机制所需的元数据。这些元数据包括 KV 缓存的位置信息、
+                序列长度、block 表等，直接影响注意力计算的效率和正确性。
+            </p>
+
+            <h2 id="方法签名">方法签名</h2>
+            <pre><code class="language-python">def _build_attention_metadata(
+    self,
+    num_tokens: int,                    # 实际 token 数量
+    num_reqs: int,                      # 实际请求数量
+    max_query_len: int,                 # 最大查询长度
+    num_tokens_padded: int | None,      # 填充后的 token 数量
+    num_reqs_padded: int | None,        # 填充后的请求数量
+    ubatch_slices: UBatchSlices | None, # 微批次切片（DP 场景）
+    logits_indices: torch.Tensor,       # logits 索引
+    use_spec_decode: bool,              # 是否使用投机解码
+    for_cudagraph_capture: bool,        # 是否为 CUDA Graph 捕获
+    num_scheduled_tokens: dict,         # 调度的 token 字典
+    num_scheduled_tokens_np: np.ndarray,# 调度的 token 数组
+    cascade_attn_prefix_lens: list,     # 级联注意力前缀长度
+) -> tuple[PerLayerAttnMetadata, CommonAttentionMetadata | None]:</code></pre>
+
+            <h2 id="执行流程">执行流程</h2>
+            <div class="mermaid">
+flowchart TD
+    A[开始] --> B{检查 KV Cache 组}
+    B -->|无 KV Cache| C[返回空元数据]
+    B -->|有 KV Cache| D[初始化参数]
+    D --> E[获取 block_table 和 slot_mapping]
+    E --> F[构建 PCP 元数据]
+    F --> G[创建 AscendCommonAttentionMetadata]
+    G --> H[遍历 KV Cache 组]
+    H --> I[构建每层注意力元数据]
+    I --> J{是否为多模态前缀 LM?}
+    J -->|是| K[处理多模态范围]
+    J -->|否| L[返回结果]
+    K --> L
+            </div>
+
+            <h2 id="核心数据结构">核心数据结构</h2>
+
+            <h3>AscendCommonAttentionMetadata</h3>
+            <p>这是 Ascend 平台上注意力元数据的核心数据结构：</p>
+            <pre><code class="language-python">@dataclass
+class AscendCommonAttentionMetadata(CommonAttentionMetadata):
+    """
+    批次级别的注意力元数据，跨层和后端共享。
+    AttentionMetadataBuilder 实例使用它构建每层元数据。
+    """
+    # CPU 上的序列长度张量
+    seq_lens_cpu: torch.Tensor = None
+
+    # CPU 上已计算 token 数量
+    num_computed_tokens_cpu: torch.Tensor = None
+
+    # 每个请求的解码 token 数（投机解码场景）
+    decode_token_per_req: int = 1
+
+    # 实际查询序列长度列表
+    actual_seq_lengths_q: list[int] = field(default_factory=list)
+
+    # NPU 上的位置索引张量
+    positions: torch.Tensor = None
+
+    # 当前注意力状态
+    attn_state: Any = None
+
+    # Graph 模式的填充大小
+    graph_pad_size: int = -1
+
+    # PCP 元数据
+    prefill_context_parallel_metadata: AscendPrefillContextParallelMetadata | None = None</code></pre>
+
+            <h2 id="关键实现细节">关键实现细节</h2>
+
+            <h3>1. KV Cache 组处理</h3>
+            <pre><code class="language-python"># 检查是否存在 KV Cache 组
+if len(self.kv_cache_config.kv_cache_groups) == 0:
+    return {}, None
+
+# 填充参数默认值
+num_tokens_padded = num_tokens_padded or num_tokens
+num_reqs_padded = num_reqs_padded or num_reqs</code></pre>
+
+            <h3>2. Block Table 和 Slot Mapping 获取</h3>
+            <div class="highlight-box">
+                <h4>Block Table</h4>
+                <p>
+                    Block Table 是 KV Cache 管理的核心数据结构，记录了每个请求的 KV Cache
+                    在物理内存中的位置。每个请求对应一个 block 列表，每个 block 存储固定数量
+                    的 token 的 KV 数据。
+                </p>
+            </div>
+            <pre><code class="language-python">def _get_block_table_and_slot_mapping(kv_cache_gid: int):
+    kv_cache_spec = kv_cache_groups[kv_cache_gid].kv_cache_spec
+
+    if isinstance(kv_cache_spec, EncoderOnlyAttentionSpec):
+        # Encoder-only 模型使用零张量
+        blk_table_tensor = torch.zeros((num_reqs_padded, 1), ...)
+        slot_mapping = torch.zeros((num_tokens_padded,), ...)
+    else:
+        # 从 input_batch 获取 block table
+        blk_table = self.input_batch.block_table[kv_cache_gid]
+        slot_mapping = blk_table.slot_mapping.gpu[:maybe_pcp_full_tokens]
+        blk_table_tensor = blk_table.get_device_tensor()[:maybe_num_reqs_padded]
+
+        # 填充未使用位置为 -1
+        slot_mapping[num_tokens:num_tokens_padded].fill_(-1)
+        blk_table_tensor[num_reqs:num_reqs_padded].fill_(0)
+
+    return blk_table_tensor, slot_mapping</code></pre>
+
+            <h3>3. Prefill Context Parallel (PCP) 元数据</h3>
+            <div class="highlight-box">
+                <h4>PCP (Prefill Context Parallel)</h4>
+                <p>
+                    PCP 是 prefill 阶段的上下文并行技术，用于处理超长序列。
+                    通过将长序列分割到多个设备并行处理，提升长序列处理能力。
+                </p>
+            </div>
+            <pre><code class="language-python">def _get_pcp_metadata(block_table_tensor):
+    if not self.use_cp:
+        return None, block_table_tensor
+    return self.pcp_manager.generate_pcp_metadata(
+        num_tokens,
+        self.query_lens,
+        self.input_batch,
+        num_scheduled_tokens_np,
+        block_table_tensor,
+        num_reqs_padded,
+        num_reqs,
+    )</code></pre>
+
+            <h3>4. 构建基础注意力元数据</h3>
+            <pre><code class="language-python">cm_base = AscendCommonAttentionMetadata(
+    query_start_loc=self.query_start_loc.gpu[: num_reqs_padded + 1],
+    query_start_loc_cpu=self.query_start_loc.cpu[: num_reqs_padded + 1],
+    seq_lens=self.seq_lens.gpu[:num_reqs_padded],
+    seq_lens_cpu=self.seq_lens.cpu[:num_reqs_padded],
+    num_computed_tokens_cpu=self.input_batch.num_computed_tokens_cpu_tensor[:num_reqs_padded],
+    num_reqs=num_reqs_padded,
+    num_actual_tokens=num_tokens,
+    max_query_len=max_query_len,
+    max_seq_len=max_seq_len,
+    block_table_tensor=block_table_gid_0,
+    slot_mapping=slot_mapping_gid_0,
+    causal=True,
+    num_input_tokens=num_tokens_padded,
+    actual_seq_lengths_q=self.actual_seq_lengths_q,
+    positions=self.positions.gpu,
+    attn_state=self.attn_state,
+    decode_token_per_req=self.decode_token_per_req,
+    prefill_context_parallel_metadata=self.long_seq_metadata,
+)</code></pre>
+
+            <h2 id="注意力组元数据构建">注意力组元数据构建</h2>
+
+            <div class="diagram">┌─────────────────────────────────────────────────────┐
+│                  KV Cache Group 0                    │
+├─────────────────────────────────────────────────────┤
+│  ┌─────────────┐  ┌─────────────┐  ┌─────────────┐ │
+│  │ Attention   │  │ Attention   │  │ Attention   │ │
+│  │   Group 0   │  │   Group 1   │  │   Group N   │ │
+│  └──────┬──────┘  └──────┬──────┘  └──────┬──────┘ │
+│         │                │                │        │
+│         ▼                ▼                ▼        │
+│  ┌─────────────┐  ┌─────────────┐  ┌─────────────┐ │
+│  │   Builder   │  │   Builder   │  │   Builder   │ │
+│  │   .build()  │  │   .build()  │  │   .build()  │ │
+│  └─────────────┘  └─────────────┘  └─────────────┘ │
+└─────────────────────────────────────────────────────┘</div>
+
+            <pre><code class="language-python">def _build_attn_group_metadata(
+    kv_cache_gid: int,
+    attn_gid: int,
+    common_attn_metadata: CommonAttentionMetadata,
+    ubid: int | None = None,
+) -> None:
+    attn_group = self.attn_groups[kv_cache_gid][attn_gid]
+    builder = attn_group.get_metadata_builder(ubid or 0)
+
+    if for_cudagraph_capture:
+        attn_metadata_i = builder.build_for_cudagraph_capture(common_attn_metadata)
+    else:
+        attn_metadata_i = builder.build(
+            common_prefix_len=cascade_attn_prefix_len,
+            common_attn_metadata=common_attn_metadata,
+            **extra_attn_metadata_args,
+        )
+
+    # 同一组的所有层共享相同元数据
+    for layer_name in attn_group.layer_names:
+        attn_metadata_dict[layer_name] = attn_metadata_i</code></pre>
+
+            <h2 id="投机解码支持">投机解码支持</h2>
+
+            <p>当启用投机解码时，需要额外处理已接受的 token 数量：</p>
+            <pre><code class="language-python">if use_spec_decode and self.need_accepted_tokens:
+    self.num_accepted_tokens.np[:num_reqs] = self.input_batch.num_accepted_tokens_cpu[:num_reqs]
+    self.num_accepted_tokens.np[num_reqs:].fill(1)
+    self.num_accepted_tokens.copy_to_gpu()
+
+# GDN (Guided Draft Network) 元数据构建
+if use_spec_decode and isinstance(builder, GDNAttentionMetadataBuilder):
+    patch_torch_npu_argsort()
+    extra_attn_metadata_args = dict(
+        num_accepted_tokens=self.num_accepted_tokens.gpu[:num_reqs_padded],
+        num_decode_draft_tokens_cpu=self.num_decode_draft_tokens.cpu[:num_reqs_padded],
+    )</code></pre>
+
+            <h2 id="多模态处理">多模态处理</h2>
+
+            <p>对于多模态前缀语言模型，需要记录图像嵌入的范围：</p>
+            <pre><code class="language-python">if self.is_mm_prefix_lm:
+    req_doc_ranges = {}
+    for req_id in self.input_batch.req_ids:
+        image_doc_ranges = []
+        req_state = self.requests[req_id]
+        for mm_feature in req_state.mm_features:
+            pos_info = mm_feature.mm_position
+            img_doc_range = pos_info.extract_embeds_range()
+            image_doc_ranges.extend(img_doc_range)
+        req_idx = self.input_batch.req_id_to_index[req_id]
+        req_doc_ranges[req_idx] = image_doc_ranges
+
+    # 设置到注意力元数据
+    for _metadata in attn_metadata.values():
+        _metadata.mm_prefix_range = req_doc_ranges</code></pre>
+
+            <h2 id="数据流图">数据流图</h2>
+
+            <div class="diagram">                     _build_attention_metadata
+                                │
+            ┌───────────────────┼───────────────────┐
+            │                   │                   │
+            ▼                   ▼                   ▼
+    ┌───────────────┐  ┌───────────────┐  ┌───────────────┐
+    │ query_start_loc│  │   seq_lens    │  │  block_table  │
+    │   (GPU/CPU)   │  │   (GPU/CPU)   │  │   (GPU/CPU)   │
+    └───────┬───────┘  └───────┬───────┘  └───────┬───────┘
+            │                   │                   │
+            └───────────────────┼───────────────────┘
+                                │
+                                ▼
+              ┌─────────────────────────────────┐
+              │ AscendCommonAttentionMetadata   │
+              └─────────────────┬───────────────┘
+                                │
+            ┌───────────────────┼───────────────────┐
+            │                   │                   │
+            ▼                   ▼                   ▼
+    ┌───────────────┐  ┌───────────────┐  ┌───────────────┐
+    │  Layer 0      │  │  Layer 1      │  │  Layer N      │
+    │  AttnMetadata │  │  AttnMetadata │  │  AttnMetadata │
+    └───────────────┘  └───────────────┘  └───────────────┘</div>
+
+            <h2 id="返回值">返回值</h2>
+
+            <p>方法返回一个元组：</p>
+            <table>
+                <thead>
+                    <tr>
+                        <th>返回值</th>
+                        <th>类型</th>
+                        <th>说明</th>
+                    </tr>
+                </thead>
+                <tbody>
+                    <tr>
+                        <td><code>attn_metadata</code></td>
+                        <td><code>PerLayerAttnMetadata</code></td>
+                        <td>每层的注意力元数据字典，key 为层名，value 为对应层的元数据</td>
+                    </tr>
+                    <tr>
+                        <td><code>spec_decode_common_attn_metadata</code></td>
+                        <td><code>CommonAttentionMetadata | None</code></td>
+                        <td>投机解码使用的通用注意力元数据</td>
+                    </tr>
+                </tbody>
+            </table>
+
+            <div class="highlight-box">
+                <h4>关键点总结</h4>
+                <ul>
+                    <li><strong>Block Table</strong>：KV Cache 的物理位置映射表</li>
+                    <li><strong>Slot Mapping</strong>：Token 到 Cache Slot 的映射</li>
+                    <li><strong>PCP 元数据</strong>：长序列并行处理支持</li>
+                    <li><strong>投机解码支持</strong>：GDN 构建器额外参数</li>
+                    <li><strong>多模态支持</strong>：图像嵌入范围记录</li>
+                </ul>
+            </div>
+
+            <div class="chapter-nav">
+                <a href="04-prepare-inputs.html">
+                    <div>
+                        <div class="nav-label">上一章</div>
+                        <div class="nav-title">← _prepare_inputs 输入准备</div>
+                    </div>
+                </a>
+                <a href="06-model-forward.html">
+                    <div>
+                        <div class="nav-label">下一章</div>
+                        <div class="nav-title">_model_forward 模型前向 →</div>
+                    </div>
+                </a>
+            </div>
+        </main>
+    </div>
+
+    <script>
+        hljs.highlightAll();
+        mermaid.initialize({
+            startOnLoad: true,
+            theme: 'dark',
+            themeVariables: {
+                darkMode: true,
+                background: '#161b22',
+                primaryColor: '#58a6ff',
+                primaryTextColor: '#c9d1d9',
+                primaryBorderColor: '#30363d',
+                lineColor: '#8b949e',
+                secondaryColor: '#21262d',
+                tertiaryColor: '#161b22'
+            }
+        });
+    </script>
+</body>
+</html>

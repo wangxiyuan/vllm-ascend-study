@@ -1,0 +1,255 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>02 - ModelRunner 实现 - NPUWorker::get_kv_cache_spec</title>
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/styles/github-dark.min.css">
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/highlight.min.js"></script>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/languages/python.min.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/mermaid@10/dist/mermaid.min.js"></script>
+    <link rel="stylesheet" href="../styles.css">
+</head>
+<body>
+    <div class="container">
+        <nav class="sidebar">
+            <a href="../index.html" class="back-to-home">← 返回主页</a>
+            <div class="sidebar-header">
+                <h1>NPUWorker::get_kv_cache_spec</h1>
+                <p>KV Cache 规范获取流程分析</p>
+            </div>
+            <div class="nav-section">
+                <div class="nav-section-title">文档目录</div>
+                <a href="index.html" class="nav-item"><span class="nav-item-number">00</span>概述</a>
+                <a href="01-entry-point.html" class="nav-item"><span class="nav-item-number">01</span>入口方法</a>
+                <a href="02-model-runner.html" class="nav-item active"><span class="nav-item-number">02</span>ModelRunner 实现</a>
+                <a href="03-layer-discovery.html" class="nav-item"><span class="nav-item-number">03</span>层发现机制</a>
+                <a href="04-attention-spec.html" class="nav-item"><span class="nav-item-number">04</span>Attention 规范</a>
+                <a href="05-mla-mamba-spec.html" class="nav-item"><span class="nav-item-number">05</span>MLA 与 Mamba 规范</a>
+                <a href="06-data-structures.html" class="nav-item"><span class="nav-item-number">06</span>数据结构定义</a>
+                <a href="07-summary.html" class="nav-item"><span class="nav-item-number">07</span>流程总结</a>
+            </div>
+        </nav>
+
+        <main class="main-content">
+            <h1>第二章：ModelRunner 实现</h1>
+
+            <h2>NPUModelRunner.get_kv_cache_spec 方法</h2>
+            <div class="file-location">vllm-ascend/vllm_ascend/worker/model_runner_v1.py:2852</div>
+
+            <pre><code class="language-python">def get_kv_cache_spec(self) -> dict[str, KVCacheSpec]:
+    """
+    Generates the KVCacheSpec by parsing the kv cache format from each
+    Attention module in the static forward context.
+    Returns:
+        KVCacheSpec: A dictionary mapping layer names to their KV cache
+        format. Layers that do not need KV cache are not included.
+    """
+
+    if has_ec_transfer() and get_ec_transfer().is_producer:
+        return {}
+
+    kv_cache_spec: dict[str, KVCacheSpec] = {}
+    attn_layers = get_layers_from_vllm_config(self.vllm_config, AttentionLayerBase)
+    # NOTE: Must process Attention/MLAAttention before MambaBase to maintain
+    # ordering expected by graph parameter update logic in attention backends.
+    mamba_layers: dict[str, MambaBase] = {}
+    for layer_name, attn_module in attn_layers.items():
+        if isinstance(attn_module, Attention):
+            if (kv_tgt_layer := attn_module.kv_sharing_target_layer_name) is not None:
+                # The layer doesn't need its own KV cache and will use that of
+                # the target layer. We skip creating a KVCacheSpec for it, so
+                # that KV cache management logic will act as this layer does
+                # not exist, and doesn't allocate KV cache for the layer. This
+                # enables the memory saving of cross-layer kv sharing, allowing
+                # a given amount of memory to accommodate longer context lengths
+                # or enable more requests to be processed simultaneously.
+                self.shared_kv_cache_layers[layer_name] = kv_tgt_layer
+                continue
+
+            if spec := attn_module.get_kv_cache_spec(self.vllm_config):
+                kv_cache_spec[layer_name] = spec
+
+        elif isinstance(attn_module, MLAAttention):
+            if self.use_sparse:
+                # TODO(cmq): This is a hack way to fix deepseek kvcache when
+                # using DSA. Fix the spec in vLLM is the final way.
+                sparse_sum_head_size = sum(self._get_sparse_kv_cache_ratio())
+                kv_cache_spec[layer_name] = MLAAttentionSpec(
+                    block_size=self.block_size,
+                    num_kv_heads=1,
+                    head_size=sparse_sum_head_size,
+                    dtype=self.kv_cache_dtype,
+                    cache_dtype_str=self.vllm_config.cache_config.cache_dtype,
+                )
+            elif spec := attn_module.get_kv_cache_spec(self.vllm_config):
+                kv_cache_spec[layer_name] = spec
+
+        elif isinstance(attn_module, MambaBase):
+            mamba_layers[layer_name] = attn_module
+
+    if len(mamba_layers) > 0:
+        if self.vllm_config.cache_config.enable_prefix_caching:
+            raise NotImplementedError("Prefix caching is not supported for Mamba yet.")
+        for layer_name, mamba_module in mamba_layers.items():
+            if spec := mamba_module.get_kv_cache_spec(self.vllm_config):
+                kv_cache_spec[layer_name] = spec
+
+    return kv_cache_spec</code></pre>
+
+            <h2>执行流程分析</h2>
+
+            <h3>1. EC Transfer 检查</h3>
+            <p>
+                方法首先检查是否存在 EC Transfer 且当前节点是否为生产者。
+                如果是，直接返回空字典，因为生产者节点不需要 KV Cache。
+            </p>
+
+            <pre><code class="language-python">if has_ec_transfer() and get_ec_transfer().is_producer:
+    return {}</code></pre>
+
+            <div class="highlight-box">
+                <h4>EC Transfer 说明</h4>
+                <p>
+                    EC Transfer 是 vLLM 的 Encoder-Decoder 架构中的编码器状态传输机制。
+                    在编码器-解码器模型中，编码器的输出需要传输给解码器。
+                    生产者（编码器端）不需要维护 KV Cache。
+                </p>
+            </div>
+
+            <h3>2. 获取所有注意力层</h3>
+
+            <pre><code class="language-python">attn_layers = get_layers_from_vllm_config(self.vllm_config, AttentionLayerBase)</code></pre>
+
+            <p>
+                通过 <code>get_layers_from_vllm_config</code> 函数获取模型中所有继承自
+                <code>AttentionLayerBase</code> 的层。这个函数是 vLLM 提供的工具函数，
+                用于从静态前向上下文中提取特定类型的层。
+            </p>
+
+            <h3>3. 遍历并分类处理层</h3>
+
+            <div class="diagram">+------------------------+
+| for layer_name,        |
+|     attn_module in     |
+|     attn_layers.items()|
++------------------------+
+           |
+           v
++------------------------+
+| isinstance check       |
++------------------------+
+           |
+     +-----+-----+-------------+
+     |           |             |
+     v           v             v
++--------+ +------------+ +-----------+
+|Attention| |MLAAttention| | MambaBase |
++--------+ +------------+ +-----------+
+     |           |             |
+     v           v             v
++--------+ +------------+ +-----------+
+|处理逻辑| |处理逻辑    | |暂存到     |
+|立即执行| |立即执行    | |mamba_layers|
++--------+ +------------+ +-----------+</div>
+
+            <h4>Attention 层处理</h4>
+            <ul>
+                <li><strong>KV 共享检查</strong>：如果层配置了 <code>kv_sharing_target_layer_name</code>，
+                    表示该层与目标层共享 KV Cache，跳过创建规范</li>
+                <li><strong>规范生成</strong>：调用 <code>attn_module.get_kv_cache_spec()</code> 获取规范</li>
+            </ul>
+
+            <h4>MLAAttention 层处理</h4>
+            <p>
+                MLA（Multi-Latent Attention）是一种特殊的注意力机制，用于 DeepSeek 等模型。
+                对于使用 Sparse 模式的 MLA，有特殊的处理逻辑。
+            </p>
+
+            <pre><code class="language-python">def _get_sparse_kv_cache_ratio(self) -> list[int]:
+    # TODO:If C8 is supported, we need to consider the number of bytes occupied by different dtypes
+    #  when calculating the ratio，for example:
+    #  [kv_lora_rank * torch.int8.itemsize, qk_rope_head_dim * torch.bfloat16.itemsize, ...]
+    return [
+        self.model_config.hf_text_config.kv_lora_rank,
+        self.model_config.hf_text_config.qk_rope_head_dim,
+        self.model_config.hf_text_config.index_head_dim,
+    ]</code></pre>
+
+            <h4>Mamba 层处理</h4>
+            <p>
+                Mamba 层被暂存到 <code>mamba_layers</code> 字典中，
+                在所有 Attention/MLA 层处理完成后再统一处理。
+                这是为了维护图参数更新逻辑所期望的顺序。
+            </p>
+
+            <div class="ascend-specific">
+                <h4>Ascend 特定实现</h4>
+                <p>
+                    在 Ascend 平台上，<code>NPUModelRunner</code> 继承自 vLLM 的 <code>GPUModelRunner</code>，
+                    但重写了 <code>get_kv_cache_spec</code> 方法以支持 Ascend 特定的优化，
+                    如 Sparse MLA 的特殊处理。
+                </p>
+            </div>
+
+            <h2>完整流程图</h2>
+
+            <div class="mermaid">
+            flowchart TD
+                A[开始 get_kv_cache_spec] --> B{检查 EC Transfer}
+                B -->|is_producer| C[返回空字典]
+                B -->|非 producer| D[获取所有 AttentionLayerBase 层]
+                D --> E[初始化空字典和 mamba_layers]
+                E --> F[遍历各层]
+                F --> G{层类型判断}
+                G -->|Attention| H{KV 共享?}
+                H -->|是| I[记录共享关系]
+                H -->|否| J[获取 Attention 规范]
+                G -->|MLAAttention| K{使用 Sparse?}
+                K -->|是| L[构建 Sparse MLA 规范]
+                K -->|否| M[获取 MLA 规范]
+                G -->|MambaBase| N[暂存到 mamba_layers]
+                I --> O{还有更多层?}
+                J --> O
+                L --> O
+                M --> O
+                N --> O
+                O -->|是| F
+                O -->|否| P{有 Mamba 层?}
+                P -->|是| Q[处理 Mamba 层规范]
+                P -->|否| R[返回 kv_cache_spec]
+                Q --> R
+            </div>
+
+            <div class="chapter-nav">
+                <a href="01-entry-point.html" class="prev-chapter">
+                    <span class="nav-label">上一章</span>
+                    <span class="nav-title">← 入口方法</span>
+                </a>
+                <a href="03-layer-discovery.html" class="next-chapter">
+                    <span class="nav-label">下一章</span>
+                    <span class="nav-title">层发现机制 →</span>
+                </a>
+            </div>
+        </main>
+    </div>
+
+    <script>
+        hljs.highlightAll();
+        mermaid.initialize({
+            startOnLoad: true,
+            theme: 'dark',
+            themeVariables: {
+                darkMode: true,
+                background: '#161b22',
+                primaryColor: '#58a6ff',
+                primaryTextColor: '#c9d1d9',
+                primaryBorderColor: '#30363d',
+                lineColor: '#8b949e',
+                secondaryColor: '#21262d',
+                tertiaryColor: '#161b22'
+            }
+        });
+    </script>
+</body>
+</html>

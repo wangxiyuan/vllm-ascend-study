@@ -1,0 +1,398 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>07 - sample_tokens - NPUModelRunner 代码分析</title>
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/styles/github-dark.min.css">
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/highlight.min.js"></script>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/languages/python.min.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/mermaid@10/dist/mermaid.min.js"></script>
+    <link rel="stylesheet" href="../styles.css">
+</head>
+<body>
+    <div class="container">
+        <nav class="sidebar">
+            <a href="../index.html" class="back-to-home">← 返回主页</a>
+            <div class="sidebar-header">
+                <h1>NPUModelRunner 代码分析</h1>
+                <p>execute_model 方法详解</p>
+            </div>
+            <div class="nav-section">
+                <div class="nav-section-title">文档目录</div>
+                <a href="index.html" class="nav-item"><span class="nav-item-number">00</span>概述</a>
+                <a href="01-class-overview.html" class="nav-item"><span class="nav-item-number">01</span>类结构与初始化</a>
+                <a href="02-execute-model.html" class="nav-item"><span class="nav-item-number">02</span>execute_model 主方法</a>
+                <a href="03-update-states.html" class="nav-item"><span class="nav-item-number">03</span>_update_states 状态更新</a>
+                <a href="04-prepare-inputs.html" class="nav-item"><span class="nav-item-number">04</span>_prepare_inputs 输入准备</a>
+                <a href="05-attention-metadata.html" class="nav-item"><span class="nav-item-number">05</span>_build_attention_metadata</a>
+                <a href="06-model-forward.html" class="nav-item"><span class="nav-item-number">06</span>_model_forward 模型前向</a>
+                <a href="07-sample-tokens.html" class="nav-item active"><span class="nav-item-number">07</span>sample_tokens 采样</a>
+                <a href="08-summary.html" class="nav-item"><span class="nav-item-number">08</span>完整流程总结</a>
+            </div>
+        </nav>
+
+        <main class="main-content">
+            <h1>第七章：sample_tokens - Token 采样</h1>
+
+            <div class="file-location">vllm_ascend/worker/model_runner_v1.py:1352-1511</div>
+
+            <h2 id="方法概述">方法概述</h2>
+            <p>
+                <code>sample_tokens</code> 方法是推理流程的最后阶段，负责从模型输出的 logits 中采样得到下一个 token。
+                该方法处理采样、logprobs 计算、投机解码验证以及输出结果的组装。
+            </p>
+
+            <h2 id="方法签名">方法签名</h2>
+            <pre><code class="language-python">def sample_tokens(
+    self,
+    grammar_output: "GrammarOutput | None"
+) -> ModelRunnerOutput | AsyncModelRunnerOutput | IntermediateTensors:</code></pre>
+
+            <h2 id="执行流程">执行流程</h2>
+            <div class="mermaid">
+flowchart TD
+    A[sample_tokens 入口] --> B{execute_model_state 是否为 None?}
+    B -->|是| C[返回 None 或 EMPTY_MODEL_RUNNER_OUTPUT]
+    B -->|否| D[解包 execute_model_state]
+    D --> E{是否有 grammar_output?}
+    E -->|是| F[应用 grammar bitmask]
+    E -->|否| G[调用 _sample 采样]
+    F --> G
+    G --> H{need_accepted_tokens?}
+    H -->|是| I[更新状态]
+    H -->|否| J[_bookkeeping_sync]
+    I --> J
+    J --> K{是否启用投机解码?}
+    K -->|是| L[propose_draft_token_ids]
+    K -->|否| M[构建 ModelRunnerOutput]
+    L --> M
+    M --> N{use_async_scheduling?}
+    N -->|是| O[返回 AsyncGPUModelRunnerOutput]
+    N -->|否| P[返回 ModelRunnerOutput]
+            </div>
+
+            <h2 id="核心实现">核心实现</h2>
+
+            <h3>1. 状态解包</h3>
+            <pre><code class="language-python">def sample_tokens(
+    self, grammar_output: "GrammarOutput | None"
+) -> ModelRunnerOutput | AsyncModelRunnerOutput | IntermediateTensors:
+    kv_connector_output = self.kv_connector_output
+    self.kv_connector_output = None
+
+    if self.execute_model_state is None:
+        # PP non-final rank 场景
+        if not kv_connector_output:
+            return None
+        if kv_connector_output.is_empty():
+            return EMPTY_MODEL_RUNNER_OUTPUT
+        output = copy(EMPTY_MODEL_RUNNER_OUTPUT)
+        output.kv_connector_output = kv_connector_output
+        return output
+
+    # 解包临时状态
+    (
+        scheduler_output,
+        logits,
+        spec_decode_metadata,
+        spec_decode_common_attn_metadata,
+        hidden_states,
+        sample_hidden_states,
+        aux_hidden_states,
+        attn_metadata,
+        positions,
+        ec_connector_output,
+        cudagraph_stats,
+    ) = self.execute_model_state
+    # 清除临时状态
+    self.execute_model_state = None</code></pre>
+
+            <h3>2. Grammar Bitmask 应用</h3>
+            <div class="highlight-box">
+                <h4>Structured Output</h4>
+                <p>
+                    Grammar output 用于实现结构化输出（如 JSON 模式），
+                    通过应用 bitmask 限制采样的 token 范围，确保输出符合指定的格式。
+                </p>
+            </div>
+            <pre><code class="language-python"># 应用结构化输出 bitmasks
+if grammar_output is not None:
+    # Ascend 不支持 torch.compile，使用 CPU 实现
+    logits_dtype = logits.dtype
+    logits = logits.to("cpu").float()
+    apply_grammar_bitmask(scheduler_output, grammar_output, self.input_batch, logits)
+    logits = logits.to(self.device).to(logits_dtype)</code></pre>
+
+            <h3>3. 采样执行</h3>
+            <pre><code class="language-python">with record_function_or_nullcontext("sample_token"):
+    sampler_output = self._sample(logits, spec_decode_metadata)
+
+if self.need_accepted_tokens:
+    self._update_states_after_model_execute(sampler_output.sampled_token_ids, scheduler_output)</code></pre>
+
+            <h4>_sample 方法实现</h4>
+            <pre><code class="language-python">def _sample(self, logits, spec_decode_metadata):
+    sampling_metadata = self.input_batch.sampling_metadata
+
+    if spec_decode_metadata is None:
+        # 普通采样
+        if lmhead_tp_enable() and logits is not None:
+            logits = logits[: self.input_batch.num_reqs]
+        return self.sampler(
+            logits=logits,
+            sampling_metadata=sampling_metadata,
+        )
+
+    # 投机解码验证采样
+    if lmhead_tp_enable() and logits is not None:
+        logits = logits[: len(spec_decode_metadata.logits_indices)]
+    sampler_output = self.rejection_sampler(
+        spec_decode_metadata,
+        None,  # draft_probs
+        logits,
+        sampling_metadata,
+    )
+    return sampler_output</code></pre>
+
+            <h3>4. 投机解码 Draft Token 提议</h3>
+            <pre><code class="language-python">def propose_draft_token_ids(sampled_token_ids):
+    assert spec_decode_common_attn_metadata is not None
+    self._draft_token_ids = self.propose_draft_token_ids(
+        sampled_token_ids,
+        self.input_batch.sampling_metadata,
+        scheduler_output,
+        spec_decode_metadata,
+        spec_decode_common_attn_metadata,
+        positions,
+        scheduler_output.total_num_scheduled_tokens,
+        hidden_states,
+        attn_metadata,
+        aux_hidden_states,
+        sample_hidden_states,
+    )
+    self._copy_draft_token_ids_to_cpu(scheduler_output)</code></pre>
+
+            <h3>5. Bookkeeping 同步</h3>
+            <pre><code class="language-python">(
+    logprobs_lists,
+    valid_sampled_token_ids,
+    prompt_logprobs_dict,
+    req_ids_output_copy,
+    req_id_to_index_output_copy,
+    invalid_req_indices,
+) = self._bookkeeping_sync(
+    scheduler_output,
+    sampler_output,
+    logits,
+    hidden_states,
+    scheduler_output.total_num_scheduled_tokens,
+    spec_decode_metadata,
+)</code></pre>
+
+            <h2 id="bookkeeping_sync">_bookkeeping_sync 详解</h2>
+
+            <p>该方法负责同步采样结果并更新状态：</p>
+            <pre><code class="language-python">def _bookkeeping_sync(
+    self,
+    scheduler_output: "SchedulerOutput",
+    sampler_output: SamplerOutput,
+    logits: torch.Tensor | None,
+    hidden_states: torch.Tensor,
+    num_scheduled_tokens: int,
+    spec_decode_metadata: SpecDecodeMetadata | None,
+) -> tuple[...]:
+    # 处理丢弃的请求
+    discard_sampled_tokens_req_indices = self.discard_request_indices.np[: self.num_discarded_requests]
+
+    # 复制请求 ID 映射（防止异步调度时被修改）
+    req_ids_output_copy = self.input_batch.req_ids.copy()
+    req_id_to_index_output_copy = self.input_batch.req_id_to_index.copy()
+
+    # 解析采样结果
+    if not self.use_async_scheduling:
+        if max_gen_len == 1:
+            # 普通采样
+            valid_sampled_token_ids = self._to_list(sampled_token_ids)
+        else:
+            # 投机解码采样
+            valid_sampled_token_ids, cu_num_tokens = RejectionSampler.parse_output(
+                sampled_token_ids,
+                self.input_batch.vocab_size,
+                discard_sampled_tokens_req_indices,
+                logprobs_tensors=logprobs_tensors,
+            )
+
+    # 缓存采样的 tokens
+    for req_idx in range(num_sampled_tokens):
+        start_idx = self.input_batch.num_tokens_no_spec[req_idx]
+        end_idx = start_idx + num_sampled_ids
+        self.input_batch.token_ids_cpu[req_idx, start_idx:end_idx] = sampled_ids
+        self.input_batch.num_tokens[req_idx] = end_idx
+
+    return (logprobs_lists, valid_sampled_token_ids, ...)</code></pre>
+
+            <h2 id="输出构建">输出构建</h2>
+
+            <h3>ModelRunnerOutput</h3>
+            <pre><code class="language-python">model_runner_output = ModelRunnerOutput(
+    req_ids=req_ids_output_copy,
+    req_id_to_index=req_id_to_index_output_copy,
+    sampled_token_ids=valid_sampled_token_ids,
+    logprobs=logprobs_lists,
+    prompt_logprobs_dict=prompt_logprobs_dict,
+    kv_connector_output=kv_connector_output,
+    pooler_output=[],
+    ec_connector_output=ec_connector_output if self.supports_mm_inputs else None,
+    cudagraph_stats=cudagraph_stats,
+)</code></pre>
+
+            <h3>异步输出（Async Scheduling）</h3>
+            <pre><code class="language-python">if not self.use_async_scheduling:
+    return model_runner_output
+
+return AsyncGPUModelRunnerOutput(
+    model_runner_output=model_runner_output,
+    sampled_token_ids=sampler_output.sampled_token_ids,
+    logprobs_tensors=sampler_output.logprobs_tensors,
+    invalid_req_indices=invalid_req_indices,
+    async_output_copy_stream=self.async_output_copy_stream,
+    vocab_size=self.input_batch.vocab_size,
+)</code></pre>
+
+            <h2 id="数据流图">数据流图</h2>
+
+            <div class="diagram">                    execute_model_state
+                            │
+            ┌───────────────┼───────────────┐
+            │               │               │
+            ▼               ▼               ▼
+    ┌─────────────┐ ┌─────────────┐ ┌─────────────┐
+    │   logits    │ │hidden_states│ │ attn_meta   │
+    └──────┬──────┘ └─────────────┘ └─────────────┘
+           │
+           ▼
+    ┌─────────────┐
+    │ grammar_    │
+    │ output?     │
+    └──────┬──────┘
+           │
+           ▼
+    ┌─────────────┐
+    │  _sample    │
+    │  sampler()  │
+    └──────┬──────┘
+           │
+           ▼
+    ┌─────────────┐
+    │sampled_token│
+    │    _ids     │
+    └──────┬──────┘
+           │
+           ├─────────────────────┐
+           │                     │
+           ▼                     ▼
+    ┌─────────────┐     ┌─────────────────┐
+    │bookkeeping  │     │spec_decode?     │
+    │   _sync     │     │propose_draft    │
+    └──────┬──────┘     └─────────────────┘
+           │
+           ▼
+    ┌─────────────────────────────────────┐
+    │         ModelRunnerOutput           │
+    │  - req_ids                          │
+    │  - sampled_token_ids                │
+    │  - logprobs                         │
+    │  - kv_connector_output              │
+    └─────────────────────────────────────┘</div>
+
+            <h2 id="返回值">返回值</h2>
+
+            <table>
+                <thead>
+                    <tr>
+                        <th>场景</th>
+                        <th>返回类型</th>
+                        <th>说明</th>
+                    </tr>
+                </thead>
+                <tbody>
+                    <tr>
+                        <td>PP 非 final rank</td>
+                        <td><code>None</code> 或 <code>EMPTY_MODEL_RUNNER_OUTPUT</code></td>
+                        <td>无需采样输出</td>
+                    </tr>
+                    <tr>
+                        <td>正常采样</td>
+                        <td><code>ModelRunnerOutput</code></td>
+                        <td>包含采样结果的标准输出</td>
+                    </tr>
+                    <tr>
+                        <td>异步调度</td>
+                        <td><code>AsyncGPUModelRunnerOutput</code></td>
+                        <td>包含 GPU 张量的异步输出</td>
+                    </tr>
+                </tbody>
+            </table>
+
+            <h2 id="AscendSampler">AscendSampler 适配</h2>
+
+            <div class="file-location">vllm_ascend/sample/sampler.py:37</div>
+
+            <pre><code class="language-python">class AscendSampler(Sampler):
+    """
+    Ascend NPU 上的采样器实现，继承自 vLLM 的 GPU Sampler。
+    主要差异在于异步指数运算的支持。
+    """
+
+    def do_async_exponential(self, b_s, head_dim, generators):
+        """异步执行指数运算，优化采样性能"""
+        pass</code></pre>
+
+            <div class="highlight-box">
+                <h4>关键点总结</h4>
+                <ul>
+                    <li><strong>状态管理</strong>：execute_model_state 存储前向传播的中间结果</li>
+                    <li><strong>Grammar 支持</strong>：通过 bitmask 实现结构化输出</li>
+                    <li><strong>投机解码</strong>：支持 draft token 提议和验证</li>
+                    <li><strong>异步调度</strong>：支持异步输出复制，提升吞吐</li>
+                    <li><strong>Bookkeeping</strong>：同步采样结果并更新请求状态</li>
+                </ul>
+            </div>
+
+            <div class="chapter-nav">
+                <a href="06-model-forward.html">
+                    <div>
+                        <div class="nav-label">上一章</div>
+                        <div class="nav-title">← _model_forward 模型前向</div>
+                    </div>
+                </a>
+                <a href="08-summary.html">
+                    <div>
+                        <div class="nav-label">下一章</div>
+                        <div class="nav-title">完整流程总结 →</div>
+                    </div>
+                </a>
+            </div>
+        </main>
+    </div>
+
+    <script>
+        hljs.highlightAll();
+        mermaid.initialize({
+            startOnLoad: true,
+            theme: 'dark',
+            themeVariables: {
+                darkMode: true,
+                background: '#161b22',
+                primaryColor: '#58a6ff',
+                primaryTextColor: '#c9d1d9',
+                primaryBorderColor: '#30363d',
+                lineColor: '#8b949e',
+                secondaryColor: '#21262d',
+                tertiaryColor: '#161b22'
+            }
+        });
+    </script>
+</body>
+</html>

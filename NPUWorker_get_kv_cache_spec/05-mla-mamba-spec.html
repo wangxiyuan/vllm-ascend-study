@@ -1,0 +1,289 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>05 - MLA 与 Mamba 规范 - NPUWorker::get_kv_cache_spec</title>
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/styles/github-dark.min.css">
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/highlight.min.js"></script>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/languages/python.min.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/mermaid@10/dist/mermaid.min.js"></script>
+    <link rel="stylesheet" href="../styles.css">
+</head>
+<body>
+    <div class="container">
+        <nav class="sidebar">
+            <a href="../index.html" class="back-to-home">← 返回主页</a>
+            <div class="sidebar-header">
+                <h1>NPUWorker::get_kv_cache_spec</h1>
+                <p>KV Cache 规范获取流程分析</p>
+            </div>
+            <div class="nav-section">
+                <div class="nav-section-title">文档目录</div>
+                <a href="index.html" class="nav-item"><span class="nav-item-number">00</span>概述</a>
+                <a href="01-entry-point.html" class="nav-item"><span class="nav-item-number">01</span>入口方法</a>
+                <a href="02-model-runner.html" class="nav-item"><span class="nav-item-number">02</span>ModelRunner 实现</a>
+                <a href="03-layer-discovery.html" class="nav-item"><span class="nav-item-number">03</span>层发现机制</a>
+                <a href="04-attention-spec.html" class="nav-item"><span class="nav-item-number">04</span>Attention 规范</a>
+                <a href="05-mla-mamba-spec.html" class="nav-item active"><span class="nav-item-number">05</span>MLA 与 Mamba 规范</a>
+                <a href="06-data-structures.html" class="nav-item"><span class="nav-item-number">06</span>数据结构定义</a>
+                <a href="07-summary.html" class="nav-item"><span class="nav-item-number">07</span>流程总结</a>
+            </div>
+        </nav>
+
+        <main class="main-content">
+            <h1>第五章：MLA 与 Mamba 规范</h1>
+
+            <h2>MLAAttention 规范生成</h2>
+
+            <h3>MLAAttention.get_kv_cache_spec 方法</h3>
+            <div class="file-location">vllm/vllm/model_executor/layers/attention/mla_attention.py:776</div>
+
+            <pre><code class="language-python">def get_kv_cache_spec(self, vllm_config: VllmConfig) -> KVCacheSpec:
+    kv_cache_dtype = kv_cache_dtype_str_to_dtype(
+        self.kv_cache_dtype, vllm_config.model_config
+    )
+    return MLAAttentionSpec(
+        block_size=vllm_config.cache_config.block_size,
+        num_kv_heads=1,
+        head_size=self.head_size,
+        dtype=kv_cache_dtype,
+        cache_dtype_str=vllm_config.cache_config.cache_dtype,
+    )</code></pre>
+
+            <h3>MLA 注意力简介</h3>
+            <p>
+                MLA（Multi-Latent Attention）是 DeepSeek 提出的一种高效注意力机制。
+                与标准注意力不同，MLA 将 KV Cache 压缩到一个低秩潜在空间中，
+                大幅减少了 KV Cache 的内存占用。
+            </p>
+
+            <div class="diagram">+-------------------+          +-------------------+
+|   Standard        |          |       MLA         |
+|   Attention       |          |   Attention       |
++-------------------+          +-------------------+
+| K: [num_heads,    |          | KV: [1,           |
+|     head_dim]     |          |     kv_lora_rank] |
+| V: [num_heads,    |   vs     | (压缩表示)        |
+|     head_dim]     |          +-------------------+
++-------------------+
+        |                              |
+        v                              v
+   较大内存占用                    较小内存占用</div>
+
+            <h3>MLAAttentionSpec 详解</h3>
+
+            <pre><code class="language-python">@dataclass(frozen=True, kw_only=True)
+class MLAAttentionSpec(FullAttentionSpec):
+    # TODO(Lucas/Chen): less hacky way to do this
+    cache_dtype_str: str | None = None
+
+    @property
+    def real_page_size_bytes(self) -> int:
+        if self.cache_dtype_str == "fp8_ds_mla":
+            # See `vllm/v1/attention/backends/mla/flashmla_sparse.py`
+            #  for details.
+            return self.block_size * 656
+        return (
+            self.block_size
+            * self.num_kv_heads
+            * self.head_size
+            * get_dtype_size(self.dtype)
+        )</code></pre>
+
+            <div class="ascend-specific">
+                <h4>Ascend Sparse MLA 特殊处理</h4>
+                <p>
+                    在 Ascend 平台上，当使用 Sparse MLA（DSA）时，有特殊的 KV Cache 规范处理逻辑：
+                </p>
+                <pre><code class="language-python"># model_runner_v1.py 中的处理
+if self.use_sparse:
+    sparse_sum_head_size = sum(self._get_sparse_kv_cache_ratio())
+    kv_cache_spec[layer_name] = MLAAttentionSpec(
+        block_size=self.block_size,
+        num_kv_heads=1,
+        head_size=sparse_sum_head_size,
+        dtype=self.kv_cache_dtype,
+        cache_dtype_str=self.vllm_config.cache_config.cache_dtype,
+    )
+
+def _get_sparse_kv_cache_ratio(self) -> list[int]:
+    return [
+        self.model_config.hf_text_config.kv_lora_rank,
+        self.model_config.hf_text_config.qk_rope_head_dim,
+        self.model_config.hf_text_config.index_head_dim,
+    ]</code></pre>
+            </div>
+
+            <h2>Mamba 规范生成</h2>
+
+            <h3>MambaBase.get_kv_cache_spec 方法</h3>
+            <div class="file-location">vllm/vllm/model_executor/layers/mamba/abstract.py:43</div>
+
+            <pre><code class="language-python">def get_kv_cache_spec(self, vllm_config: VllmConfig) -> KVCacheSpec | None:
+    mamba_block_size = vllm_config.cache_config.mamba_block_size
+    page_size_padded = vllm_config.cache_config.mamba_page_size_padded
+    return MambaSpec(
+        shapes=self.get_state_shape(),
+        dtypes=self.get_state_dtype(),
+        block_size=mamba_block_size,
+        page_size_padded=page_size_padded,
+        mamba_type=self.mamba_type,
+        mamba_cache_mode=vllm_config.cache_config.mamba_cache_mode,
+        num_speculative_blocks=(
+            vllm_config.speculative_config.num_speculative_tokens
+            if vllm_config.speculative_config
+            else 0
+        ),
+    )</code></pre>
+
+            <h3>Mamba 层简介</h3>
+            <p>
+                Mamba 是一种状态空间模型（SSM），与 Transformer 的注意力机制不同，
+                Mamba 通过维护一个压缩的状态来处理序列，而不是缓存所有历史 token。
+            </p>
+
+            <div class="diagram">+-------------------+          +-------------------+
+|   Transformer     |          |      Mamba        |
+|   Attention       |          |      SSM          |
++-------------------+          +-------------------+
+| KV Cache:         |          | State:            |
+| [num_tokens,      |   vs     | [state_dim]       |
+|  num_heads,       |          | (固定大小)        |
+|  head_dim]        |          +-------------------+
++-------------------+                   |
+        |                               |
+        v                               v
+   内存与序列长度成正比              内存固定，与序列长度无关</div>
+
+            <h3>MambaSpec 详解</h3>
+
+            <pre><code class="language-python">@dataclass(frozen=True)
+class MambaSpec(KVCacheSpec):
+    shapes: tuple[tuple[int, ...], ...]
+    dtypes: tuple[torch.dtype]
+    page_size_padded: int | None = None
+    mamba_type: str = "mamba2"
+    mamba_cache_mode: str = "none"
+    num_speculative_blocks: int = 0
+
+    @property
+    def page_size_bytes(self) -> int:
+        page_size = sum(
+            prod(shape) * get_dtype_size(dtype)
+            for (shape, dtype) in zip(self.shapes, self.dtypes)
+        )
+        if self.page_size_padded is not None:
+            assert self.page_size_padded >= page_size
+            return self.page_size_padded
+        return page_size
+
+    def max_memory_usage_bytes(self, vllm_config: VllmConfig) -> int:
+        if vllm_config.cache_config.mamba_cache_mode == "all":
+            max_model_len = vllm_config.model_config.max_model_len
+            return cdiv(max_model_len, self.block_size) * self.page_size_bytes
+        elif vllm_config.cache_config.mamba_cache_mode == "align":
+            return self.page_size_bytes * (2 + self.num_speculative_blocks)
+        else:
+            return self.page_size_bytes * (1 + self.num_speculative_blocks)</code></pre>
+
+            <h3>Mamba Cache 模式</h3>
+
+            <table>
+                <thead>
+                    <tr>
+                        <th>模式</th>
+                        <th>描述</th>
+                        <th>内存使用</th>
+                    </tr>
+                </thead>
+                <tbody>
+                    <tr>
+                        <td><code>"none"</code></td>
+                        <td>默认模式，只维护当前状态</td>
+                        <td>最小</td>
+                    </tr>
+                    <tr>
+                        <td><code>"align"</code></td>
+                        <td>对齐模式，维护额外的状态</td>
+                        <td>中等</td>
+                    </tr>
+                    <tr>
+                        <td><code>"all"</code></td>
+                        <td>全缓存模式，类似 Attention</td>
+                        <td>最大（与序列长度成正比）</td>
+                    </tr>
+                </tbody>
+            </table>
+
+            <h2>MambaBase 抽象类</h2>
+
+            <pre><code class="language-python">class MambaBase(AttentionLayerBase):
+    """
+    Base class for Mamba-like layers which support the v1 engine.
+    Inherit from this class if you implement a custom layer.
+    """
+
+    # Contains the KV cache (mamba state) for the layer
+    # in the shape specified by `self.get_state_shape`.
+    kv_cache: tuple[torch.Tensor, ...]
+
+    @abstractmethod
+    def get_state_shape(self) -> Iterable[tuple[int, ...]]:
+        """
+        Defines the shape of the state.
+        For mamba layers this is usually a (conv_state, ssm_state) tuple.
+        In this case, returns (conv_state_shape, ssm_state_shape).
+        """
+        pass
+
+    @property
+    @abstractmethod
+    def mamba_type(self) -> str:
+        pass
+
+    @abstractmethod
+    def get_state_dtype(self) -> tuple[torch.dtype, ...]:
+        pass</code></pre>
+
+            <div class="highlight-box">
+                <h4>Mamba 的优势</h4>
+                <p>
+                    Mamba 等 SSM 模型的核心优势是推理时的内存占用是常数级别的（O(1)），
+                    而不像 Transformer 那样与序列长度成正比（O(n)）。
+                    这使得 Mamba 能够处理非常长的序列而不会出现内存瓶颈。
+                </p>
+            </div>
+
+            <div class="chapter-nav">
+                <a href="04-attention-spec.html" class="prev-chapter">
+                    <span class="nav-label">上一章</span>
+                    <span class="nav-title">← Attention 规范</span>
+                </a>
+                <a href="06-data-structures.html" class="next-chapter">
+                    <span class="nav-label">下一章</span>
+                    <span class="nav-title">数据结构定义 →</span>
+                </a>
+            </div>
+        </main>
+    </div>
+
+    <script>
+        hljs.highlightAll();
+        mermaid.initialize({
+            startOnLoad: true,
+            theme: 'dark',
+            themeVariables: {
+                darkMode: true,
+                background: '#161b22',
+                primaryColor: '#58a6ff',
+                primaryTextColor: '#c9d1d9',
+                primaryBorderColor: '#30363d',
+                lineColor: '#8b949e',
+                secondaryColor: '#21262d',
+                tertiaryColor: '#161b22'
+            }
+        });
+    </script>
+</body>
+</html>

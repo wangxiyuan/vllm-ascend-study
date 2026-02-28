@@ -1,0 +1,393 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>08 - 完整流程总结 - NPUModelRunner 代码分析</title>
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/styles/github-dark.min.css">
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/highlight.min.js"></script>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/languages/python.min.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/mermaid@10/dist/mermaid.min.js"></script>
+    <link rel="stylesheet" href="../styles.css">
+</head>
+<body>
+    <div class="container">
+        <nav class="sidebar">
+            <a href="../index.html" class="back-to-home">← 返回主页</a>
+            <div class="sidebar-header">
+                <h1>NPUModelRunner 代码分析</h1>
+                <p>execute_model 方法详解</p>
+            </div>
+            <div class="nav-section">
+                <div class="nav-section-title">文档目录</div>
+                <a href="index.html" class="nav-item"><span class="nav-item-number">00</span>概述</a>
+                <a href="01-class-overview.html" class="nav-item"><span class="nav-item-number">01</span>类结构与初始化</a>
+                <a href="02-execute-model.html" class="nav-item"><span class="nav-item-number">02</span>execute_model 主方法</a>
+                <a href="03-update-states.html" class="nav-item"><span class="nav-item-number">03</span>_update_states 状态更新</a>
+                <a href="04-prepare-inputs.html" class="nav-item"><span class="nav-item-number">04</span>_prepare_inputs 输入准备</a>
+                <a href="05-attention-metadata.html" class="nav-item"><span class="nav-item-number">05</span>_build_attention_metadata</a>
+                <a href="06-model-forward.html" class="nav-item"><span class="nav-item-number">06</span>_model_forward 模型前向</a>
+                <a href="07-sample-tokens.html" class="nav-item"><span class="nav-item-number">07</span>sample_tokens 采样</a>
+                <a href="08-summary.html" class="nav-item active"><span class="nav-item-number">08</span>完整流程总结</a>
+            </div>
+        </nav>
+
+        <main class="main-content">
+            <h1>第八章：完整流程总结</h1>
+
+            <h2 id="端到端流程">端到端执行流程</h2>
+
+            <div class="mermaid">
+flowchart TD
+    subgraph 入口阶段
+        A[execute_model 入口] --> B[scheduler_output 解析]
+        B --> C{是否有调度请求?}
+        C -->|否| D[返回空输出]
+        C -->|是| E[_update_states 状态更新]
+    end
+
+    subgraph 准备阶段
+        E --> F[_prepare_inputs 输入准备]
+        F --> G[input_ids, positions]
+        F --> H[spec_decode_metadata]
+        G --> I[_build_attention_metadata]
+        H --> I
+    end
+
+    subgraph 前向传播
+        I --> J[set_ascend_forward_context]
+        J --> K[_model_forward]
+        K --> L[self.model forward]
+        L --> M[hidden_states]
+        M --> N{PP last rank?}
+        N -->|否| O[返回 IntermediateTensors]
+        N -->|是| P[compute_logits]
+    end
+
+    subgraph 采样阶段
+        P --> Q[execute_model_state 存储]
+        Q --> R[sample_tokens]
+        R --> S{grammar_output?}
+        S -->|是| T[apply_grammar_bitmask]
+        S -->|否| U[_sample]
+        T --> U
+        U --> V[bookkeeping_sync]
+        V --> W{spec_decode?}
+        W -->|是| X[propose_draft_token_ids]
+        W -->|否| Y[ModelRunnerOutput]
+        X --> Y
+    end
+            </div>
+
+            <h2 id="核心组件交互">核心组件交互图</h2>
+
+            <div class="diagram">┌─────────────────────────────────────────────────────────────────────────┐
+│                           NPUModelRunner                                │
+├─────────────────────────────────────────────────────────────────────────┤
+│                                                                         │
+│  ┌─────────────┐    ┌─────────────┐    ┌─────────────┐                │
+│  │   Input     │    │  Attention  │    │    Model    │                │
+│  │   Batch     │───→│  Metadata   │───→│   Forward   │                │
+│  └─────────────┘    └─────────────┘    └─────────────┘                │
+│         │                  │                  │                        │
+│         │                  │                  │                        │
+│         ▼                  ▼                  ▼                        │
+│  ┌─────────────┐    ┌─────────────┐    ┌─────────────┐                │
+│  │  Scheduler  │    │  KV Cache   │    │   Sampler   │                │
+│  │   Output    │    │   Manager   │    │             │                │
+│  └─────────────┘    └─────────────┘    └─────────────┘                │
+│                                                                         │
+└─────────────────────────────────────────────────────────────────────────┘
+                                    │
+                                    ▼
+                        ┌─────────────────────┐
+                        │  ModelRunnerOutput  │
+                        │  - sampled_tokens   │
+                        │  - logprobs         │
+                        │  - kv_connector     │
+                        └─────────────────────┘</div>
+
+            <h2 id="关键数据结构">关键数据结构</h2>
+
+            <h3>输入数据流</h3>
+            <table>
+                <thead>
+                    <tr>
+                        <th>阶段</th>
+                        <th>数据结构</th>
+                        <th>内容</th>
+                    </tr>
+                </thead>
+                <tbody>
+                    <tr>
+                        <td>调度器输出</td>
+                        <td><code>SchedulerOutput</code></td>
+                        <td>scheduled_requests, num_scheduled_tokens, block tables</td>
+                    </tr>
+                    <tr>
+                        <td>输入批次</td>
+                        <td><code>InputBatch</code></td>
+                        <td>req_ids, token_ids, sampling_metadata, block_table</td>
+                    </tr>
+                    <tr>
+                        <td>注意力元数据</td>
+                        <td><code>AscendCommonAttentionMetadata</code></td>
+                        <td>seq_lens, block_table_tensor, slot_mapping, positions</td>
+                    </tr>
+                </tbody>
+            </table>
+
+            <h3>输出数据流</h3>
+            <table>
+                <thead>
+                    <tr>
+                        <th>阶段</th>
+                        <th>数据结构</th>
+                        <th>内容</th>
+                    </tr>
+                </thead>
+                <tbody>
+                    <tr>
+                        <td>模型输出</td>
+                        <td><code>torch.Tensor / IntermediateTensors</code></td>
+                        <td>hidden_states, logits</td>
+                    </tr>
+                    <tr>
+                        <td>采样结果</td>
+                        <td><code>SamplerOutput</code></td>
+                        <td>sampled_token_ids, logprobs_tensors</td>
+                    </tr>
+                    <tr>
+                        <td>最终输出</td>
+                        <td><code>ModelRunnerOutput</code></td>
+                        <td>req_ids, sampled_token_ids, logprobs, kv_connector_output</td>
+                    </tr>
+                </tbody>
+            </table>
+
+            <h2 id="性能优化技术">性能优化技术</h2>
+
+            <h3>1. ACL Graph（昇腾计算图）</h3>
+            <div class="highlight-box">
+                <h4>Graph 模式</h4>
+                <ul>
+                    <li><strong>NONE</strong>：Eager 模式，每次执行都重新构建计算图</li>
+                    <li><strong>PIECEWISE</strong>：分段图模式，部分算子使用图优化</li>
+                    <li><strong>FULL</strong>：全图模式，整个前向传播使用预编译的图</li>
+                </ul>
+            </div>
+            <pre><code class="language-python"># Graph 模式调度
+cudagraph_mode, batch_descriptor = self.cudagraph_dispatcher.dispatch(
+    num_tokens=num_tokens_padded,
+    has_lora=has_lora,
+    uniform_decode=uniform_decode,
+    disable_full=use_cascade_attn or has_encoder_output,
+)</code></pre>
+
+            <h3>2. 序列并行（Sequence Parallelism）</h3>
+            <pre><code class="language-python"># SP 填充
+def _pad_for_sequence_parallelism(self, num_scheduled_tokens: int) -> int:
+    tp_size = self.vllm_config.parallel_config.tensor_parallel_size
+    if enable_sp(self.vllm_config):
+        return round_up(num_scheduled_tokens, tp_size)
+    return num_scheduled_tokens
+
+# All-Gather hidden states
+if get_forward_context().flash_comm_v1_enabled:
+    hidden_states = self._all_gather_hidden_states_and_aux(hidden_states)</code></pre>
+
+            <h3>3. Prefill Context Parallel (PCP)</h3>
+            <pre><code class="language-python"># PCP 元数据生成
+if self.use_cp:
+    self.long_seq_metadata, block_table_gid_0 = _get_pcp_metadata(block_table_gid_0)
+
+# PCP hidden states 恢复
+if self.pcp_size > 1:
+    hidden_states = self.pcp_manager.get_restore_hidden_states(hidden_states)</code></pre>
+
+            <h3>4. 投机解码</h3>
+            <div class="diagram">┌─────────────────────────────────────────────────────────────┐
+│                      Speculative Decoding                   │
+├─────────────────────────────────────────────────────────────┤
+│                                                             │
+│  ┌─────────────┐      ┌─────────────┐      ┌─────────────┐ │
+│  │   Drafter   │ ───→ │   Target    │ ───→ │  Rejection  │ │
+│  │   Model     │      │   Model     │      │   Sampler   │ │
+│  └─────────────┘      └─────────────┘      └─────────────┘ │
+│        │                    │                    │         │
+│        ▼                    ▼                    ▼         │
+│  ┌─────────────┐      ┌─────────────┐      ┌─────────────┐ │
+│  │ draft_tokens│      │   logits    │      │ accepted    │ │
+│  │  (k tokens) │      │             │      │  tokens     │ │
+│  └─────────────┘      └─────────────┘      └─────────────┘ │
+│                                                             │
+│  支持: EAGLE, Ngram, Medusa                                │
+└─────────────────────────────────────────────────────────────┘</div>
+
+            <h3>5. 异步调度</h3>
+            <pre><code class="language-python"># 异步输出复制
+if self.use_async_scheduling:
+    return AsyncGPUModelRunnerOutput(
+        model_runner_output=model_runner_output,
+        sampled_token_ids=sampler_output.sampled_token_ids,
+        logprobs_tensors=sampler_output.logprobs_tensors,
+        async_output_copy_stream=self.async_output_copy_stream,
+    )</code></pre>
+
+            <h2 id="Ascend特定优化">Ascend 特定优化</h2>
+
+            <h3>1. Paged Attention 支持</h3>
+            <pre><code class="language-python">def using_paged_attention(runtime_shape: int, vllm_config: VllmConfig) -> bool:
+    if vllm_config.speculative_config is not None:
+        return False
+    if get_ascend_device_type() == AscendDeviceType.A5:
+        return False
+    cudagraph_mode = vllm_config.compilation_config.cudagraph_mode
+    if cudagraph_mode != CUDAGraphMode.FULL_DECODE_ONLY:
+        return False
+    return runtime_shape in get_ascend_config().pa_shape_list</code></pre>
+
+            <h3>2. 异步指数运算</h3>
+            <pre><code class="language-python"># AscendSampler 中
+def do_async_exponential(self, b_s, head_dim, generators):
+    """异步执行 softmax 中的指数运算"""
+    pass</code></pre>
+
+            <h3>3. KV Sharing Fast Prefill</h3>
+            <pre><code class="language-python">if self.cache_config.kv_sharing_fast_prefill:
+    cm_base.num_logits_indices = logits_indices.size(0)
+    cm_base.logits_indices_padded = self._prepare_kv_sharing_fast_prefill(logits_indices)</code></pre>
+
+            <h2 id="错误处理">错误处理与边界条件</h2>
+
+            <h3>1. 空批次处理</h3>
+            <pre><code class="language-python">if not scheduler_output.num_scheduled_tokens:
+    return EMPTY_MODEL_RUNNER_OUTPUT</code></pre>
+
+            <h3>2. PP 非 Final Rank</h3>
+            <pre><code class="language-python">if not get_pp_group().is_last_rank:
+    assert isinstance(hidden_states, IntermediateTensors)
+    hidden_states.kv_connector_output = kv_connector_output
+    return hidden_states</code></pre>
+
+            <h3>3. 丢弃请求处理</h3>
+            <pre><code class="language-python">discard_sampled_tokens_req_indices = self.discard_request_indices.np[: self.num_discarded_requests]
+for i in discard_sampled_tokens_req_indices:
+    valid_sampled_token_ids[int(i)].clear()</code></pre>
+
+            <h2 id="完整调用链">完整调用链</h2>
+
+            <div class="mermaid">
+sequenceDiagram
+    participant S as Scheduler
+    participant MR as ModelRunner
+    participant IB as InputBatch
+    participant AM as AttentionMetadata
+    participant M as Model
+    participant SM as Sampler
+
+    S->>MR: execute_model(scheduler_output)
+    MR->>MR: _update_states()
+    MR->>IB: 更新请求状态
+
+    MR->>MR: _prepare_inputs()
+    MR->>IB: 获取 input_ids, positions
+
+    MR->>MR: _build_attention_metadata()
+    MR->>AM: 构建 seq_lens, block_table
+
+    MR->>MR: _model_forward()
+    MR->>M: model(input_ids, positions, attn_metadata)
+    M-->>MR: hidden_states
+
+    MR->>MR: compute_logits()
+    MR->>MR: 保存 execute_model_state
+
+    MR->>MR: sample_tokens()
+    MR->>SM: sampler(logits, sampling_metadata)
+    SM-->>MR: sampled_token_ids
+
+    MR->>MR: _bookkeeping_sync()
+    MR-->>S: ModelRunnerOutput
+            </div>
+
+            <h2 id="性能指标">性能关键指标</h2>
+
+            <table>
+                <thead>
+                    <tr>
+                        <th>指标</th>
+                        <th>说明</th>
+                        <th>优化方法</th>
+                    </tr>
+                </thead>
+                <tbody>
+                    <tr>
+                        <td>Time To First Token (TTFT)</td>
+                        <td>首 token 延迟</td>
+                        <td>Chunked Prefill, PCP</td>
+                    </tr>
+                    <tr>
+                        <td>Inter-Token Latency (ITL)</td>
+                        <td>token 间延迟</td>
+                        <td>ACL Graph, Paged Attention</td>
+                    </tr>
+                    <tr>
+                        <td>Throughput</td>
+                        <td>吞吐量</td>
+                        <td>Batching, Speculative Decoding</td>
+                    </tr>
+                    <tr>
+                        <td>Memory Usage</td>
+                        <td>显存占用</td>
+                        <td>KV Cache Sharing, Block Table</td>
+                    </tr>
+                </tbody>
+            </table>
+
+            <div class="highlight-box">
+                <h4>总结</h4>
+                <p>
+                    <code>NPUModelRunner.execute_model</code> 是 vLLM-Ascend 推理引擎的核心方法，
+                    通过精心设计的状态管理、注意力元数据构建、模型前向传播和 token 采样流程，
+                    实现了高效的 NPU 推理。关键优化包括 ACL Graph、序列并行、PCP、投机解码等技术，
+                    充分发挥了昇腾 NPU 的硬件特性。
+                </p>
+            </div>
+
+            <div class="chapter-nav">
+                <a href="07-sample-tokens.html">
+                    <div>
+                        <div class="nav-label">上一章</div>
+                        <div class="nav-title">← sample_tokens 采样</div>
+                    </div>
+                </a>
+                <a href="index.html">
+                    <div>
+                        <div class="nav-label">返回</div>
+                        <div class="nav-title">目录概览 →</div>
+                    </div>
+                </a>
+            </div>
+        </main>
+    </div>
+
+    <script>
+        hljs.highlightAll();
+        mermaid.initialize({
+            startOnLoad: true,
+            theme: 'dark',
+            themeVariables: {
+                darkMode: true,
+                background: '#161b22',
+                primaryColor: '#58a6ff',
+                primaryTextColor: '#c9d1d9',
+                primaryBorderColor: '#30363d',
+                lineColor: '#8b949e',
+                secondaryColor: '#21262d',
+                tertiaryColor: '#161b22'
+            }
+        });
+    </script>
+</body>
+</html>

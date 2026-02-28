@@ -1,0 +1,185 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>01 - 入口方法 - NPUWorker::get_kv_cache_spec</title>
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/styles/github-dark.min.css">
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/highlight.min.js"></script>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/languages/python.min.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/mermaid@10/dist/mermaid.min.js"></script>
+    <link rel="stylesheet" href="../styles.css">
+</head>
+<body>
+    <div class="container">
+        <nav class="sidebar">
+            <a href="../index.html" class="back-to-home">← 返回主页</a>
+            <div class="sidebar-header">
+                <h1>NPUWorker::get_kv_cache_spec</h1>
+                <p>KV Cache 规范获取流程分析</p>
+            </div>
+            <div class="nav-section">
+                <div class="nav-section-title">文档目录</div>
+                <a href="index.html" class="nav-item"><span class="nav-item-number">00</span>概述</a>
+                <a href="01-entry-point.html" class="nav-item active"><span class="nav-item-number">01</span>入口方法</a>
+                <a href="02-model-runner.html" class="nav-item"><span class="nav-item-number">02</span>ModelRunner 实现</a>
+                <a href="03-layer-discovery.html" class="nav-item"><span class="nav-item-number">03</span>层发现机制</a>
+                <a href="04-attention-spec.html" class="nav-item"><span class="nav-item-number">04</span>Attention 规范</a>
+                <a href="05-mla-mamba-spec.html" class="nav-item"><span class="nav-item-number">05</span>MLA 与 Mamba 规范</a>
+                <a href="06-data-structures.html" class="nav-item"><span class="nav-item-number">06</span>数据结构定义</a>
+                <a href="07-summary.html" class="nav-item"><span class="nav-item-number">07</span>流程总结</a>
+            </div>
+        </nav>
+
+        <main class="main-content">
+            <h1>第一章：入口方法 - NPUWorker::get_kv_cache_spec</h1>
+
+            <h2>方法定义</h2>
+            <div class="file-location">vllm-ascend/vllm_ascend/worker/worker.py:486</div>
+
+            <pre><code class="language-python">def get_kv_cache_spec(self) -> dict[str, KVCacheSpec]:
+    return self.model_runner.get_kv_cache_spec()</code></pre>
+
+            <h2>方法分析</h2>
+            <p>
+                <code>NPUWorker.get_kv_cache_spec</code> 是一个非常简洁的委托方法，
+                它直接将调用转发给 <code>self.model_runner</code>。
+                这种设计遵循了单一职责原则：
+            </p>
+
+            <ul>
+                <li><strong>NPUWorker</strong>：负责 Worker 级别的协调和生命周期管理</li>
+                <li><strong>NPUModelRunner</strong>：负责具体的模型执行和状态管理</li>
+            </ul>
+
+            <h2>NPUWorker 类结构</h2>
+
+            <div class="diagram">+----------------------------------+
+|           NPUWorker              |
++----------------------------------+
+| - vllm_config: VllmConfig        |
+| - local_rank: int                |
+| - rank: int                      |
+| - model_runner: NPUModelRunner   |
+| - cache_config: CacheConfig      |
+| - profiler: Optional             |
++----------------------------------+
+| + __init__(...)                  |
+| + init_device()                  |
+| + load_model()                   |
+| + determine_available_memory()   |
+| + execute_model(...)             |
+| + get_kv_cache_spec()            |
+| + initialize_from_config(...)    |
+| + ...                            |
++----------------------------------+</div>
+
+            <h2>调用时机</h2>
+
+            <p>
+                <code>get_kv_cache_spec</code> 方法在引擎初始化阶段被调用，
+                用于确定 KV Cache 的内存布局。典型的调用流程如下：
+            </p>
+
+            <div class="mermaid">
+            sequenceDiagram
+                participant Engine as EngineCore
+                participant Worker as NPUWorker
+                participant Runner as NPUModelRunner
+                participant Layers as Model Layers
+
+                Engine->>Worker: determine_available_memory()
+                Worker->>Worker: profile_run()
+                Worker-->>Engine: available_memory_bytes
+
+                Engine->>Worker: get_kv_cache_spec()
+                Worker->>Runner: get_kv_cache_spec()
+                Runner->>Layers: 遍历各层
+                Layers-->>Runner: KVCacheSpec
+                Runner-->>Worker: dict[str, KVCacheSpec]
+                Worker-->>Engine: dict[str, KVCacheSpec]
+
+                Note over Engine: 根据 KVCacheSpec 计算内存分配
+            </div>
+
+            <h2>返回值说明</h2>
+
+            <p>方法返回一个字典，键为层名称，值为对应的 <code>KVCacheSpec</code> 对象：</p>
+
+            <pre><code class="language-python"># 示例返回值结构
+{
+    "model.layers.0.self_attn": FullAttentionSpec(
+        block_size=16,
+        num_kv_heads=32,
+        head_size=128,
+        dtype=torch.float16,
+        ...
+    ),
+    "model.layers.1.self_attn": FullAttentionSpec(...),
+    # ... 更多层
+}</code></pre>
+
+            <div class="highlight-box">
+                <h4>设计模式</h4>
+                <p>
+                    这里使用了<strong>委托模式</strong>（Delegation Pattern）。
+                    Worker 将具体的规范计算工作委托给 ModelRunner，
+                    使得 Worker 保持轻量级，专注于协调工作。
+                </p>
+            </div>
+
+            <h2>继承关系</h2>
+
+            <p>
+                <code>NPUWorker</code> 继承自 vLLM 的 <code>WorkerBase</code> 类，
+                <code>get_kv_cache_spec</code> 是 <code>WorkerBase</code> 中定义的抽象方法。
+            </p>
+
+            <div class="diagram">+------------------+
+|    WorkerBase    | (vllm/v1/worker/worker_base.py)
++------------------+
+| + get_kv_cache_spec() -> dict[str, KVCacheSpec]
++------------------+
+         ^
+         |
+         | extends
+         |
++------------------+
+|    NPUWorker     | (vllm_ascend/worker/worker.py)
++------------------+
+| + get_kv_cache_spec() -> dict[str, KVCacheSpec]
+|   # 委托给 model_runner
++------------------+</div>
+
+            <div class="chapter-nav">
+                <a href="index.html" class="prev-chapter">
+                    <span class="nav-label">上一章</span>
+                    <span class="nav-title">← 概述</span>
+                </a>
+                <a href="02-model-runner.html" class="next-chapter">
+                    <span class="nav-label">下一章</span>
+                    <span class="nav-title">ModelRunner 实现 →</span>
+                </a>
+            </div>
+        </main>
+    </div>
+
+    <script>
+        hljs.highlightAll();
+        mermaid.initialize({
+            startOnLoad: true,
+            theme: 'dark',
+            themeVariables: {
+                darkMode: true,
+                background: '#161b22',
+                primaryColor: '#58a6ff',
+                primaryTextColor: '#c9d1d9',
+                primaryBorderColor: '#30363d',
+                lineColor: '#8b949e',
+                secondaryColor: '#21262d',
+                tertiaryColor: '#161b22'
+            }
+        });
+    </script>
+</body>
+</html>

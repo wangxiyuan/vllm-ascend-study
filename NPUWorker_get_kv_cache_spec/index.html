@@ -1,0 +1,170 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>NPUWorker::get_kv_cache_spec - KV Cache 规范获取流程</title>
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/styles/github-dark.min.css">
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/highlight.min.js"></script>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/languages/python.min.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/mermaid@10/dist/mermaid.min.js"></script>
+    <link rel="stylesheet" href="../styles.css">
+</head>
+<body>
+    <div class="container">
+        <nav class="sidebar">
+            <a href="../index.html" class="back-to-home">← 返回主页</a>
+            <div class="sidebar-header">
+                <h1>NPUWorker::get_kv_cache_spec</h1>
+                <p>KV Cache 规范获取流程分析</p>
+            </div>
+            <div class="nav-section">
+                <div class="nav-section-title">文档目录</div>
+                <a href="index.html" class="nav-item active"><span class="nav-item-number">00</span>概述</a>
+                <a href="01-entry-point.html" class="nav-item"><span class="nav-item-number">01</span>入口方法</a>
+                <a href="02-model-runner.html" class="nav-item"><span class="nav-item-number">02</span>ModelRunner 实现</a>
+                <a href="03-layer-discovery.html" class="nav-item"><span class="nav-item-number">03</span>层发现机制</a>
+                <a href="04-attention-spec.html" class="nav-item"><span class="nav-item-number">04</span>Attention 规范</a>
+                <a href="05-mla-mamba-spec.html" class="nav-item"><span class="nav-item-number">05</span>MLA 与 Mamba 规范</a>
+                <a href="06-data-structures.html" class="nav-item"><span class="nav-item-number">06</span>数据结构定义</a>
+                <a href="07-summary.html" class="nav-item"><span class="nav-item-number">07</span>流程总结</a>
+            </div>
+        </nav>
+
+        <main class="main-content">
+            <h1>NPUWorker::get_kv_cache_spec - KV Cache 规范获取流程</h1>
+
+            <h2>概述</h2>
+            <p>
+                本文档深入分析 vLLM Ascend 中 <code>get_kv_cache_spec</code> 方法的完整调用链，
+                该方法用于获取模型中各层的 KV Cache 规范定义。KV Cache 规范描述了每个层需要什么样的 KV Cache，
+                包括块大小、数据类型、注意力头数等关键参数。
+            </p>
+
+            <h2>方法功能</h2>
+            <p>
+                <code>get_kv_cache_spec</code> 方法的核心职责是：
+            </p>
+            <ul>
+                <li><strong>遍历模型层</strong>：发现模型中所有需要 KV Cache 的层</li>
+                <li><strong>收集规范信息</strong>：从每个层获取其 KV Cache 规范</li>
+                <li><strong>构建映射表</strong>：返回层名到 KVCacheSpec 的字典映射</li>
+            </ul>
+
+            <h2>调用链概览</h2>
+
+            <div class="diagram">+-------------------+     +------------------------+     +-------------------------+
+| NPUWorker        |     | NPUModelRunner         |     | Attention/MLA/Mamba     |
+| get_kv_cache_spec| --> | get_kv_cache_spec      | --> | get_kv_cache_spec       |
++-------------------+     +------------------------+     +-------------------------+
+         |                          |                                |
+         | 委托调用                  | 遍历层                          | 返回具体规范
+         v                          v                                v
++-------------------+     +------------------------+     +-------------------------+
+| worker.py:486     |     | model_runner_v1.py:2852|    | attention.py:519        |
+| 直接转发           |     | 核心逻辑                |    | 各类型层实现             |
++-------------------+     +------------------------+     +-------------------------+</div>
+
+            <h2>架构图</h2>
+
+            <div class="mermaid">
+            graph TD
+                A[NPUWorker.get_kv_cache_spec] --> B[NPUModelRunner.get_kv_cache_spec]
+                B --> C{检查 EC Transfer}
+                C -->|is_producer| D[返回空字典]
+                C -->|非 producer| E[get_layers_from_vllm_config]
+                E --> F[遍历 Attention 层]
+                F --> G{层类型判断}
+                G -->|Attention| H[Attention.get_kv_cache_spec]
+                G -->|MLAAttention| I[MLAAttention.get_kv_cache_spec]
+                G -->|MambaBase| J[MambaBase.get_kv_cache_spec]
+                H --> K[FullAttentionSpec / SlidingWindowSpec]
+                I --> L[MLAAttentionSpec]
+                J --> M[MambaSpec]
+                K --> N[返回 kv_cache_spec 字典]
+                L --> N
+                M --> N
+            </div>
+
+            <h2>关键数据结构</h2>
+
+            <table>
+                <thead>
+                    <tr>
+                        <th>数据结构</th>
+                        <th>描述</th>
+                        <th>适用层类型</th>
+                    </tr>
+                </thead>
+                <tbody>
+                    <tr>
+                        <td><code>FullAttentionSpec</code></td>
+                        <td>全注意力规范</td>
+                        <td>标准 Attention 层</td>
+                    </tr>
+                    <tr>
+                        <td><code>SlidingWindowSpec</code></td>
+                        <td>滑动窗口注意力规范</td>
+                        <td>滑动窗口 Attention</td>
+                    </tr>
+                    <tr>
+                        <td><code>MLAAttentionSpec</code></td>
+                        <td>MLA 注意力规范</td>
+                        <td>MLAAttention 层</td>
+                    </tr>
+                    <tr>
+                        <td><code>MambaSpec</code></td>
+                        <td>Mamba 状态规范</td>
+                        <td>MambaBase 层</td>
+                    </tr>
+                </tbody>
+            </table>
+
+            <h2>文档结构</h2>
+            <p>本文档系列包含以下章节：</p>
+            <ol>
+                <li><strong>入口方法</strong>：分析 NPUWorker.get_kv_cache_spec 的实现</li>
+                <li><strong>ModelRunner 实现</strong>：深入 NPUModelRunner 的核心逻辑</li>
+                <li><strong>层发现机制</strong>：了解如何从配置中获取模型层</li>
+                <li><strong>Attention 规范</strong>：分析标准注意力层的规范生成</li>
+                <li><strong>MLA 与 Mamba 规范</strong>：分析特殊层的规范生成</li>
+                <li><strong>数据结构定义</strong>：详解 KVCacheSpec 相关类</li>
+                <li><strong>流程总结</strong>：完整的流程回顾与总结</li>
+            </ol>
+
+            <div class="highlight-box">
+                <h4>关键点</h4>
+                <p>
+                    <code>get_kv_cache_spec</code> 方法是 vLLM 内存管理的关键环节，
+                    它决定了 KV Cache 的内存布局和分配策略。理解这个流程对于优化 vLLM 的内存使用至关重要。
+                </p>
+            </div>
+
+            <div class="chapter-nav">
+                <a href="01-entry-point.html" class="next-chapter">
+                    <span class="nav-label">下一章</span>
+                    <span class="nav-title">入口方法 →</span>
+                </a>
+            </div>
+        </main>
+    </div>
+
+    <script>
+        hljs.highlightAll();
+        mermaid.initialize({
+            startOnLoad: true,
+            theme: 'dark',
+            themeVariables: {
+                darkMode: true,
+                background: '#161b22',
+                primaryColor: '#58a6ff',
+                primaryTextColor: '#c9d1d9',
+                primaryBorderColor: '#30363d',
+                lineColor: '#8b949e',
+                secondaryColor: '#21262d',
+                tertiaryColor: '#161b22'
+            }
+        });
+    </script>
+</body>
+</html>

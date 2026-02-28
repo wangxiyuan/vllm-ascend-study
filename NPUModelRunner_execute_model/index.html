@@ -1,0 +1,158 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>NPUModelRunner.execute_model 代码分析</title>
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/styles/github-dark.min.css">
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/highlight.min.js"></script>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/languages/python.min.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/mermaid@10/dist/mermaid.min.js"></script>
+    <link rel="stylesheet" href="../styles.css">
+</head>
+<body>
+    <div class="container">
+        <nav class="sidebar">
+            <a href="../index.html" class="back-to-home">← 返回主页</a>
+            <div class="sidebar-header">
+                <h1>NPUModelRunner 代码分析</h1>
+                <p>execute_model 方法详解</p>
+            </div>
+            <div class="nav-section">
+                <div class="nav-section-title">文档目录</div>
+                <a href="index.html" class="nav-item active"><span class="nav-item-number">00</span>概述</a>
+                <a href="01-class-overview.html" class="nav-item"><span class="nav-item-number">01</span>类结构与初始化</a>
+                <a href="02-execute-model.html" class="nav-item"><span class="nav-item-number">02</span>execute_model 主方法</a>
+                <a href="03-update-states.html" class="nav-item"><span class="nav-item-number">03</span>_update_states 状态更新</a>
+                <a href="04-prepare-inputs.html" class="nav-item"><span class="nav-item-number">04</span>_prepare_inputs 输入准备</a>
+                <a href="05-attention-metadata.html" class="nav-item"><span class="nav-item-number">05</span>_build_attention_metadata</a>
+                <a href="06-model-forward.html" class="nav-item"><span class="nav-item-number">06</span>_model_forward 模型前向</a>
+                <a href="07-sample-tokens.html" class="nav-item"><span class="nav-item-number">07</span>sample_tokens 采样</a>
+                <a href="08-summary.html" class="nav-item"><span class="nav-item-number">08</span>完整流程总结</a>
+            </div>
+        </nav>
+
+        <main class="main-content">
+            <h1>NPUModelRunner.execute_model 代码分析</h1>
+
+            <div class="file-location">vllm_ascend/worker/model_runner_v1.py</div>
+
+            <h2 id="概述">概述</h2>
+            <p>
+                本文档详细分析 vLLM-Ascend 项目中 <code>NPUModelRunner</code> 类的 <code>execute_model</code> 方法。
+                该方法是 NPU 上模型推理的核心执行入口，负责将调度器输出的请求转换为模型可处理的输入张量，
+                执行模型前向传播，并为后续的 token 采样做准备。
+            </p>
+
+            <h2 id="类继承关系">类继承关系</h2>
+            <div class="diagram">┌─────────────────────┐
+│    GPUModelRunner   │  ← vLLM 基类 (vllm/v1/worker/gpu_model_runner.py)
+└──────────┬──────────┘
+           │ 继承
+           ▼
+┌─────────────────────┐
+│   NPUModelRunner    │  ← Ascend 适配实现 (vllm_ascend/worker/model_runner_v1.py)
+└─────────────────────┘</div>
+
+            <h2 id="执行流程概览">执行流程概览</h2>
+            <div class="mermaid">
+flowchart TD
+    A[execute_model 入口] --> B[_update_states 更新状态]
+    B --> C[_prepare_inputs 准备输入]
+    C --> D[_build_attention_metadata 构建注意力元数据]
+    D --> E[_preprocess 预处理]
+    E --> F[_model_forward 模型前向传播]
+    F --> G{是否为最后 PP 阶段?}
+    G -->|否| H[返回 IntermediateTensors]
+    G -->|是| I[保存状态到 execute_model_state]
+    I --> J[返回 None]
+    J --> K[sample_tokens 采样]
+    K --> L[返回 ModelRunnerOutput]
+            </div>
+
+            <h2 id="文档结构">文档结构</h2>
+            <table>
+                <thead>
+                    <tr>
+                        <th>章节</th>
+                        <th>内容</th>
+                    </tr>
+                </thead>
+                <tbody>
+                    <tr>
+                        <td><a href="01-class-overview.html">01 - 类结构与初始化</a></td>
+                        <td>NPUModelRunner 类的定义、继承关系和初始化过程</td>
+                    </tr>
+                    <tr>
+                        <td><a href="02-execute-model.html">02 - execute_model 主方法</a></td>
+                        <td>execute_model 方法的核心流程和关键分支</td>
+                    </tr>
+                    <tr>
+                        <td><a href="03-update-states.html">03 - _update_states 状态更新</a></td>
+                        <td>批状态管理和请求状态更新</td>
+                    </tr>
+                    <tr>
+                        <td><a href="04-prepare-inputs.html">04 - _prepare_inputs 输入准备</a></td>
+                        <td>输入张量准备、位置编码和投机解码元数据</td>
+                    </tr>
+                    <tr>
+                        <td><a href="05-attention-metadata.html">05 - _build_attention_metadata</a></td>
+                        <td>注意力元数据构建和 KV 缓存管理</td>
+                    </tr>
+                    <tr>
+                        <td><a href="06-model-forward.html">06 - _model_forward 模型前向</a></td>
+                        <td>模型前向传播执行和 ACL Graph 集成</td>
+                    </tr>
+                    <tr>
+                        <td><a href="07-sample-tokens.html">07 - sample_tokens 采样</a></td>
+                        <td>Token 采样和输出处理</td>
+                    </tr>
+                    <tr>
+                        <td><a href="08-summary.html">08 - 完整流程总结</a></td>
+                        <td>端到端流程总结和 Ascend 特定优化</td>
+                    </tr>
+                </tbody>
+            </table>
+
+            <div class="highlight-box">
+                <h4>关键概念</h4>
+                <ul>
+                    <li><strong>NPU</strong>: Neural Processing Unit，华为昇腾 AI 处理器</li>
+                    <li><strong>ACL Graph</strong>: 昇腾计算图，类似于 CUDA Graph，用于优化推理性能</li>
+                    <li><strong>SplitFuse</strong>: 将 prefill 和 decode 请求合并到同一批次处理</li>
+                    <li><strong>PCP</strong>: Prefill Context Parallel，prefill 阶段的上下文并行</li>
+                    <li><strong>投机解码</strong>: 使用小型 drafter 模型预测 token，加速推理</li>
+                </ul>
+            </div>
+
+            <div class="chapter-nav">
+                <span></span>
+                <a href="01-class-overview.html">
+                    <div>
+                        <div class="nav-label">下一章</div>
+                        <div class="nav-title">类结构与初始化 →</div>
+                    </div>
+                </a>
+            </div>
+        </main>
+    </div>
+
+    <script>
+        hljs.highlightAll();
+        mermaid.initialize({
+            startOnLoad: true,
+            theme: 'dark',
+            themeVariables: {
+                darkMode: true,
+                background: '#161b22',
+                primaryColor: '#58a6ff',
+                primaryTextColor: '#c9d1d9',
+                primaryBorderColor: '#30363d',
+                lineColor: '#8b949e',
+                secondaryColor: '#21262d',
+                tertiaryColor: '#161b22'
+            }
+        });
+    </script>
+</body>
+</html>

@@ -1,0 +1,350 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>04 - _prepare_inputs 输入准备 - NPUModelRunner 代码分析</title>
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/styles/github-dark.min.css">
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/highlight.min.js"></script>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/languages/python.min.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/mermaid@10/dist/mermaid.min.js"></script>
+    <link rel="stylesheet" href="../styles.css">
+</head>
+<body>
+    <div class="container">
+        <nav class="sidebar">
+            <a href="../index.html" class="back-to-home">← 返回主页</a>
+            <div class="sidebar-header">
+                <h1>NPUModelRunner 代码分析</h1>
+                <p>execute_model 方法详解</p>
+            </div>
+            <div class="nav-section">
+                <div class="nav-section-title">文档目录</div>
+                <a href="index.html" class="nav-item"><span class="nav-item-number">00</span>概述</a>
+                <a href="01-class-overview.html" class="nav-item"><span class="nav-item-number">01</span>类结构与初始化</a>
+                <a href="02-execute-model.html" class="nav-item"><span class="nav-item-number">02</span>execute_model 主方法</a>
+                <a href="03-update-states.html" class="nav-item"><span class="nav-item-number">03</span>_update_states 状态更新</a>
+                <a href="04-prepare-inputs.html" class="nav-item active"><span class="nav-item-number">04</span>_prepare_inputs 输入准备</a>
+                <a href="05-attention-metadata.html" class="nav-item"><span class="nav-item-number">05</span>_build_attention_metadata</a>
+                <a href="06-model-forward.html" class="nav-item"><span class="nav-item-number">06</span>_model_forward 模型前向</a>
+                <a href="07-sample-tokens.html" class="nav-item"><span class="nav-item-number">07</span>sample_tokens 采样</a>
+                <a href="08-summary.html" class="nav-item"><span class="nav-item-number">08</span>完整流程总结</a>
+            </div>
+        </nav>
+
+        <main class="main-content">
+            <h1>04 - _prepare_inputs 输入准备</h1>
+
+            <div class="file-location">vllm_ascend/worker/model_runner_v1.py:530-789</div>
+
+            <h2 id="方法签名">方法签名</h2>
+            <pre><code class="language-python">def _prepare_inputs(
+    self,
+    scheduler_output: "SchedulerOutput",
+    num_scheduled_tokens: np.ndarray,
+) -> tuple[torch.Tensor, SpecDecodeMetadata | None]:
+    """
+    :return: tuple[
+        logits_indices, spec_decode_metadata,
+    ]
+    """</code></pre>
+
+            <h2 id="核心职责">核心职责</h2>
+            <div class="diagram">┌─────────────────────────────────────────────────────────┐
+│                   _prepare_inputs 职责                  │
+├─────────────────────────────────────────────────────────┤
+│  1. 构建注意力状态 (attn_state)                          │
+│  2. 计算位置编码 (positions)                             │
+│  3. 计算槽位映射 (slot_mapping)                          │
+│  4. 准备输入 ID (input_ids)                              │
+│  5. 处理 PCP (Prefill Context Parallel)                 │
+│  6. 处理投机解码元数据                                   │
+│  7. 返回 logits 索引和投机解码元数据                     │
+└─────────────────────────────────────────────────────────┘</div>
+
+            <h2 id="处理流程">处理流程</h2>
+
+            <h3>1. 异步优化：提交块表复制</h3>
+            <pre><code class="language-python"># 优化：首先开始复制块表，以便与后续 CPU 操作重叠
+self.input_batch.block_table.commit_block_table(num_reqs)</code></pre>
+
+            <h3>2. 构建注意力状态</h3>
+            <pre><code class="language-python"># 计算有效令牌数
+if not scheduler_output.scheduled_spec_decode_tokens:
+    num_valid_tokens = num_scheduled_tokens
+else:
+    num_valid_tokens = np.array([
+        scheduler_output.num_scheduled_tokens[i]
+        - len(scheduler_output.scheduled_spec_decode_tokens.get(i, []))
+        for i in self.input_batch.req_ids
+    ], dtype=np.int32)
+
+# 构建注意力状态
+attn_state = self._build_attn_state(num_reqs, num_scheduled_tokens, num_valid_tokens)
+
+# 判断是否包含 prefill
+with_prefill = attn_state not in [
+    AscendAttentionState.DecodeOnly,
+    AscendAttentionState.SpecDecoding
+]
+self.with_prefill = with_prefill</code></pre>
+
+            <h3>3. 注意力状态判断逻辑</h3>
+            <pre><code class="language-python">def _build_attn_state(self, num_reqs, num_scheduled_tokens, num_valid_tokens):
+    # 首次 prefill，无 KV 缓存
+    if np.all(self.input_batch.num_computed_tokens_cpu[:num_reqs] == 0):
+        return AscendAttentionState.PrefillNoCache
+
+    # 纯 decode 阶段：每个请求只调度 1 个令牌
+    if np.all(num_scheduled_tokens == 1):
+        if self.speculative_config and self.speculative_config.method == "mtp":
+            return AscendAttentionState.SpecDecoding
+        return AscendAttentionState.DecodeOnly
+
+    # 投机解码：每个请求只有 1 个有效令牌
+    if np.all(num_valid_tokens == 1):
+        if self.speculative_config:
+            return AscendAttentionState.SpecDecoding
+        return AscendAttentionState.ChunkedPrefill
+
+    # 分块 prefill
+    if self.scheduler_config.enable_chunked_prefill:
+        return AscendAttentionState.ChunkedPrefill
+
+    # Prefill 有缓存命中
+    return AscendAttentionState.PrefillCacheHit</code></pre>
+
+            <div class="highlight-box">
+                <h4>注意力状态选择策略</h4>
+                <table>
+                    <thead>
+                        <tr>
+                            <th>状态</th>
+                            <th>条件</th>
+                            <th>优化内核</th>
+                        </tr>
+                    </thead>
+                    <tbody>
+                        <tr>
+                            <td><code>PrefillNoCache</code></td>
+                            <td>所有请求 <code>num_computed_tokens == 0</code></td>
+                            <td>FlashAttention Prefill</td>
+                        </tr>
+                        <tr>
+                            <td><code>DecodeOnly</code></td>
+                            <td>所有请求 <code>num_scheduled_tokens == 1</code></td>
+                            <td>PagedAttention Decode</td>
+                        </tr>
+                        <tr>
+                            <td><code>ChunkedPrefill</code></td>
+                            <td>启用分块 prefill 且混合批次</td>
+                            <td>FlashAttention + PagedAttention</td>
+                        </tr>
+                        <tr>
+                            <td><code>SpecDecoding</code></td>
+                            <td>投机解码模式</td>
+                            <td>专门的投机解码内核</td>
+                        </tr>
+                    </tbody>
+                </table>
+            </div>
+
+            <h3>4. 计算位置编码</h3>
+            <pre><code class="language-python"># 获取位置
+positions_np = self.positions.np[:total_num_scheduled_tokens]
+cu_num_tokens, arange = self._get_cumsum_and_arange(num_scheduled_tokens)
+
+# 位置 = 已计算令牌数 + 当前偏移
+np.add(
+    self.input_batch.num_computed_tokens_cpu[req_indices],
+    arange,
+    out=positions_np
+)</code></pre>
+
+            <div class="diagram">示例：2 个请求，分别调度 3 和 2 个令牌
+
+请求 0: num_computed_tokens = 5, scheduled = 3
+请求 1: num_computed_tokens = 10, scheduled = 2
+
+req_indices:     [0, 0, 0, 1, 1]
+arange:          [0, 1, 2, 0, 1]
+positions:       [5, 6, 7, 10, 11]
+
+请求 0 的位置: 5, 6, 7
+请求 1 的位置: 10, 11</div>
+
+            <h3>5. 计算槽位映射</h3>
+            <pre><code class="language-python"># 计算槽位映射
+self.input_batch.block_table.compute_slot_mapping(req_indices, positions_np)
+self.input_batch.block_table.commit_slot_mapping(total_num_scheduled_tokens)</code></pre>
+
+            <h3>6. PCP (Prefill Context Parallel) 处理</h3>
+            <pre><code class="language-python">if self.use_cp:
+    self.pcp_manager.init_batch_info(
+        num_scheduled_tokens,
+        self.input_batch.num_reqs,
+    )
+
+# 投机解码 + PCP
+if self.speculative_config and self.use_cp:
+    self.pcp_manager.generate_pcp_mtp_input(
+        total_num_scheduled_tokens,
+        scheduler_output.num_scheduled_tokens,
+        with_prefill,
+        self.input_batch,
+        ...
+    )
+
+# PCP 令牌更新
+if self.pcp_size > 1:
+    num_scheduled_tokens[:num_reqs], position_pcp = \
+        self.pcp_manager.update_tokens_for_pcp(
+            num_scheduled_tokens[:num_reqs],
+            self.arange_np,
+        )
+    # 重新计算相关参数
+    total_num_scheduled_tokens = sum(num_scheduled_tokens)
+    req_indices = np.repeat(self.arange_np[:num_reqs], num_scheduled_tokens)
+    ...</code></pre>
+
+            <div class="ascend-specific">
+                <h4>PCP (Prefill Context Parallel)</h4>
+                <p>
+                    PCP 是 Ascend 特有的优化，用于在 prefill 阶段实现上下文并行。
+                    它将长序列分割到多个 NPU 上并行处理，然后通过 all-gather 合并结果。
+                </p>
+            </div>
+
+            <h3>7. 准备 input_ids</h3>
+            <pre><code class="language-python"># 计算令牌索引
+token_indices = positions_np + req_indices * self.input_batch.token_ids_cpu.shape[1]
+token_indices_tensor = torch.from_numpy(token_indices)
+
+# 使用 torch.index_select 高效索引
+torch.index_select(
+    self.input_batch.token_ids_cpu_tensor.flatten(),
+    0,
+    token_indices_tensor,
+    out=self.input_ids.cpu[:total_num_scheduled_tokens],
+)</code></pre>
+
+            <h3>8. 处理投机解码元数据</h3>
+            <pre><code class="language-python">use_spec_decode = len(scheduler_output.scheduled_spec_decode_tokens) > 0
+
+if not use_spec_decode:
+    # 无投机解码
+    spec_decode_metadata = None
+    num_sampled_tokens = np.ones(num_reqs, dtype=np.int32)
+
+    if self.use_cp:
+        logits_indices = self.pcp_manager.get_logits_indices(cu_num_tokens)
+    else:
+        # logits 索引 = 每个请求的最后一个令牌位置
+        logits_indices = self.query_start_loc.gpu[1 : num_reqs + 1] - 1
+else:
+    # 有投机解码
+    num_draft_tokens = np.zeros(num_reqs, dtype=np.int32)
+    for req_id, draft_token_ids in scheduler_output.scheduled_spec_decode_tokens.items():
+        req_idx = self.input_batch.req_id_to_index[req_id]
+        num_draft_tokens[req_idx] = len(draft_token_ids)
+
+    spec_decode_metadata = self._calc_spec_decode_metadata(
+        num_draft_tokens,
+        cu_num_tokens,
+        num_pcp_pads=self.pcp_manager.num_pcp_pads_cpu[:num_reqs] if self.pcp_size > 1 else None,
+    )
+    logits_indices = spec_decode_metadata.logits_indices
+    num_sampled_tokens = num_draft_tokens + 1</code></pre>
+
+            <h2 id="返回值">返回值</h2>
+            <table>
+                <thead>
+                    <tr>
+                        <th>返回值</th>
+                        <th>类型</th>
+                        <th>说明</th>
+                    </tr>
+                </thead>
+                <tbody>
+                    <tr>
+                        <td><code>logits_indices</code></td>
+                        <td><code>torch.Tensor</code></td>
+                        <td>需要计算 logits 的令牌索引</td>
+                    </tr>
+                    <tr>
+                        <td><code>spec_decode_metadata</code></td>
+                        <td><code>SpecDecodeMetadata | None</code></td>
+                        <td>投机解码元数据（如果启用）</td>
+                    </tr>
+                </tbody>
+            </table>
+
+            <h2 id="数据流图">数据流图</h2>
+            <div class="mermaid">
+flowchart LR
+    subgraph "输入"
+        SO[SchedulerOutput]
+        NST[num_scheduled_tokens]
+    end
+
+    subgraph "处理"
+        BS[构建注意力状态]
+        CP[计算位置]
+        CS[计算槽位映射]
+        PI[准备 input_ids]
+        PCP[PCP 处理]
+        SD[投机解码元数据]
+    end
+
+    subgraph "输出"
+        LI[logits_indices]
+        SM[spec_decode_metadata]
+    end
+
+    SO --> BS
+    NST --> BS
+    BS --> CP
+    CP --> CS
+    CS --> PI
+    PI --> PCP
+    PCP --> SD
+    SD --> LI
+    SD --> SM
+            </div>
+
+            <div class="chapter-nav">
+                <a href="03-update-states.html">
+                    <div>
+                        <div class="nav-label">上一章</div>
+                        <div class="nav-title">← _update_states 状态更新</div>
+                    </div>
+                </a>
+                <a href="05-attention-metadata.html">
+                    <div>
+                        <div class="nav-label">下一章</div>
+                        <div class="nav-title">_build_attention_metadata →</div>
+                    </div>
+                </a>
+            </div>
+        </main>
+    </div>
+
+    <script>
+        hljs.highlightAll();
+        mermaid.initialize({
+            startOnLoad: true,
+            theme: 'dark',
+            themeVariables: {
+                darkMode: true,
+                background: '#161b22',
+                primaryColor: '#58a6ff',
+                primaryTextColor: '#c9d1d9',
+                primaryBorderColor: '#30363d',
+                lineColor: '#8b949e',
+                secondaryColor: '#21262d',
+                tertiaryColor: '#161b22'
+            }
+        });
+    </script>
+</body>
+</html>

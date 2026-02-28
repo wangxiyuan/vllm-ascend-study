@@ -1,0 +1,285 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>03 - _update_states 状态更新 - NPUModelRunner 代码分析</title>
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/styles/github-dark.min.css">
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/highlight.min.js"></script>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/languages/python.min.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/mermaid@10/dist/mermaid.min.js"></script>
+    <link rel="stylesheet" href="../styles.css">
+</head>
+<body>
+    <div class="container">
+        <nav class="sidebar">
+            <a href="../index.html" class="back-to-home">← 返回主页</a>
+            <div class="sidebar-header">
+                <h1>NPUModelRunner 代码分析</h1>
+                <p>execute_model 方法详解</p>
+            </div>
+            <div class="nav-section">
+                <div class="nav-section-title">文档目录</div>
+                <a href="index.html" class="nav-item"><span class="nav-item-number">00</span>概述</a>
+                <a href="01-class-overview.html" class="nav-item"><span class="nav-item-number">01</span>类结构与初始化</a>
+                <a href="02-execute-model.html" class="nav-item"><span class="nav-item-number">02</span>execute_model 主方法</a>
+                <a href="03-update-states.html" class="nav-item active"><span class="nav-item-number">03</span>_update_states 状态更新</a>
+                <a href="04-prepare-inputs.html" class="nav-item"><span class="nav-item-number">04</span>_prepare_inputs 输入准备</a>
+                <a href="05-attention-metadata.html" class="nav-item"><span class="nav-item-number">05</span>_build_attention_metadata</a>
+                <a href="06-model-forward.html" class="nav-item"><span class="nav-item-number">06</span>_model_forward 模型前向</a>
+                <a href="07-sample-tokens.html" class="nav-item"><span class="nav-item-number">07</span>sample_tokens 采样</a>
+                <a href="08-summary.html" class="nav-item"><span class="nav-item-number">08</span>完整流程总结</a>
+            </div>
+        </nav>
+
+        <main class="main-content">
+            <h1>03 - _update_states 状态更新</h1>
+
+            <div class="file-location">vllm/vllm/v1/worker/gpu_model_runner.py:934-1133</div>
+
+            <h2 id="方法概述">方法概述</h2>
+            <p>
+                <code>_update_states</code> 方法负责根据调度器输出更新缓存状态和持久批处理数据。
+                这是 <code>_prepare_inputs</code> 函数的前置步骤，确保输入 GPU 张量正确创建。
+            </p>
+
+            <pre><code class="language-python">def _update_states(self, scheduler_output: "SchedulerOutput") -> None:
+    """Update the cached states and the persistent batch with the scheduler
+    output.
+
+    The updated states are used by the `_prepare_inputs` function to create
+    the input GPU tensors for the model.
+
+    The SamplingMetadata is updated and copied to the GPU if there is a
+    new/resumed/paused/finished request in the batch.
+    """</code></pre>
+
+            <h2 id="核心职责">核心职责</h2>
+            <div class="diagram">┌─────────────────────────────────────────────────────────┐
+│                    _update_states 职责                  │
+├─────────────────────────────────────────────────────────┤
+│  1. 移除已完成请求的缓存状态                              │
+│  2. 从持久批中移除完成的请求                              │
+│  3. 释放编码器缓存                                        │
+│  4. 移除未调度的请求                                      │
+│  5. 添加新请求到缓存                                      │
+│  6. 更新运行/恢复请求的状态                               │
+│  7. 将请求添加到持久批                                    │
+└─────────────────────────────────────────────────────────┘</div>
+
+            <h2 id="处理流程">处理流程</h2>
+
+            <h3>1. 移除已完成请求</h3>
+            <pre><code class="language-python"># 从缓存状态中移除完成的请求
+for req_id in scheduler_output.finished_req_ids:
+    self.requests.pop(req_id, None)
+    self.num_prompt_logprobs.pop(req_id, None)
+
+# 从持久批中移除完成的请求
+for req_id in scheduler_output.finished_req_ids:
+    self.input_batch.remove_request(req_id)</code></pre>
+
+            <div class="highlight-box">
+                <h4>边界情况处理</h4>
+                <p>
+                    <code>finished_req_ids</code> 和 <code>scheduled_req_ids</code> 可能重叠。
+                    这发生在请求被中止然后以相同 ID 重新提交的情况。此时将它们视为两个独立的请求：
+                    清除第一个请求的缓存状态，并将第二个作为新请求处理。
+                </p>
+            </div>
+
+            <h3>2. 释放编码器缓存</h3>
+            <pre><code class="language-python"># 释放缓存的编码器输出（用于多模态模型）
+for mm_hash in scheduler_output.free_encoder_mm_hashes:
+    self.encoder_cache.pop(mm_hash, None)</code></pre>
+
+            <h3>3. 移除未调度的请求</h3>
+            <pre><code class="language-python"># 计算未调度的请求
+scheduled_req_ids = scheduler_output.num_scheduled_tokens.keys()
+cached_req_ids = self.input_batch.req_id_to_index.keys()
+resumed_req_ids = scheduler_output.scheduled_cached_reqs.resumed_req_ids
+
+unscheduled_req_ids = cached_req_ids - (scheduled_req_ids - resumed_req_ids)
+
+# 从持久批中移除未调度的请求（但保留缓存状态）
+for req_id in unscheduled_req_ids:
+    self.input_batch.remove_request(req_id)</code></pre>
+
+            <div class="highlight-box">
+                <h4>持久批优化假设</h4>
+                <p>
+                    持久批优化假设连续的批次包含大部分相同的请求。如果批次的请求重叠率低
+                    （例如在两组不同的请求之间交替），此优化会变得非常低效。
+                </p>
+            </div>
+
+            <h3>4. 添加新请求</h3>
+            <pre><code class="language-python">reqs_to_add: list[CachedRequestState] = []
+
+for new_req_data in scheduler_output.scheduled_new_reqs:
+    req_id = new_req_data.req_id
+
+    # 处理流式请求（可能已存在）
+    if req_id in self.requests:
+        req_state = self._update_streaming_request(req_id, new_req_data)
+        reqs_to_add.append(req_state)
+        continue
+
+    # 创建随机数生成器（用于确定性采样）
+    sampling_params = new_req_data.sampling_params
+    if sampling_params and sampling_params.sampling_type == SamplingType.RANDOM_SEED:
+        generator = torch.Generator(device=self.device)
+        generator.manual_seed(sampling_params.seed)
+    else:
+        generator = None
+
+    # 创建请求状态
+    req_state = CachedRequestState(
+        req_id=req_id,
+        prompt_token_ids=new_req_data.prompt_token_ids,
+        prompt_embeds=new_req_data.prompt_embeds,
+        mm_features=new_req_data.mm_features,
+        sampling_params=sampling_params,
+        pooling_params=pooling_params,
+        generator=generator,
+        block_ids=new_req_data.block_ids,
+        num_computed_tokens=new_req_data.num_computed_tokens,
+        output_token_ids=[],
+        lora_request=new_req_data.lora_request,
+    )
+    self.requests[req_id] = req_state
+    reqs_to_add.append(req_state)</code></pre>
+
+            <h3>5. 更新运行/恢复请求状态</h3>
+            <pre><code class="language-python">is_last_rank = get_pp_group().is_last_rank
+req_data = scheduler_output.scheduled_cached_reqs
+scheduled_spec_tokens = scheduler_output.scheduled_spec_decode_tokens
+
+# 获取有效采样令牌计数
+valid_sampled_token_count = self._get_valid_sampled_token_count()
+
+for i, req_id in enumerate(req_data.req_ids):
+    req_state = self.requests[req_id]
+    num_computed_tokens = req_data.num_computed_tokens[i]
+    new_block_ids = req_data.new_block_ids[i]
+    resumed_from_preemption = req_id in req_data.resumed_req_ids
+    num_output_tokens = req_data.num_output_tokens[i]
+    req_index = self.input_batch.req_id_to_index.get(req_id)
+
+    # 处理异步调度 + 投机解码
+    if req_state.prev_num_draft_len and self.use_async_scheduling:
+        # 更新 num_computed_tokens 以反映接受的投机令牌
+        ...
+
+    # 更新已计算令牌数
+    req_state.num_computed_tokens = num_computed_tokens
+
+    # 更新输出令牌
+    if not is_last_rank:
+        # 流水线并行：非最后阶段
+        new_token_ids = req_data.new_token_ids[i]
+        ...
+
+    # 更新块 ID
+    if not resumed_from_preemption:
+        if new_block_ids is not None:
+            # 追加新块到现有块 ID
+            for block_ids, new_ids in zip(req_state.block_ids, new_block_ids):
+                block_ids.extend(new_ids)
+    else:
+        # 从抢占中恢复：替换块 ID
+        req_state.block_ids = new_block_ids</code></pre>
+
+            <h3>6. 将请求添加到持久批</h3>
+            <pre><code class="language-python">for req_state in reqs_to_add:
+    self.input_batch.add_request(req_state)</code></pre>
+
+            <h2 id="数据结构">数据结构</h2>
+
+            <h3>CachedRequestState</h3>
+            <pre><code class="language-python">@dataclass
+class CachedRequestState:
+    req_id: str
+    prompt_token_ids: list[int]
+    prompt_embeds: torch.Tensor | None
+    mm_features: list[MultiModalFeature]
+    sampling_params: SamplingParams | None
+    pooling_params: PoolingParams | None
+    generator: torch.Generator | None
+    block_ids: list[list[int]]
+    num_computed_tokens: int
+    output_token_ids: list[int]
+    lora_request: LoRARequest | None
+
+    @property
+    def num_tokens(self) -> int:
+        return len(self.prompt_token_ids) + len(self.output_token_ids)</code></pre>
+
+            <h2 id="状态转换图">状态转换图</h2>
+            <div class="mermaid">
+stateDiagram-v2
+    [*] --> New: 新请求到达
+    New --> Running: 添加到批处理
+    Running --> Running: 继续调度
+    Running --> Preempted: 被抢占
+    Preempted --> Running: 恢复调度
+    Running --> Finished: 完成
+    Finished --> [*]: 从缓存移除
+            </div>
+
+            <h2 id="与prepare_inputs的关系">与 _prepare_inputs 的关系</h2>
+            <div class="mermaid">
+sequenceDiagram
+    participant SO as SchedulerOutput
+    participant US as _update_states
+    participant Cache as requests cache
+    participant Batch as input_batch
+    participant PI as _prepare_inputs
+
+    SO->>US: 传入调度输出
+    US->>Cache: 移除完成请求
+    US->>Batch: 移除完成请求
+    US->>Cache: 添加新请求
+    US->>Cache: 更新运行请求状态
+    US->>Batch: 添加新请求到批
+    US-->>PI: 完成
+    PI->>Batch: 读取请求状态
+    PI->>PI: 准备 GPU 张量
+            </div>
+
+            <div class="chapter-nav">
+                <a href="02-execute-model.html">
+                    <div>
+                        <div class="nav-label">上一章</div>
+                        <div class="nav-title">← execute_model 主方法</div>
+                    </div>
+                </a>
+                <a href="04-prepare-inputs.html">
+                    <div>
+                        <div class="nav-label">下一章</div>
+                        <div class="nav-title">_prepare_inputs 输入准备 →</div>
+                    </div>
+                </a>
+            </div>
+        </main>
+    </div>
+
+    <script>
+        hljs.highlightAll();
+        mermaid.initialize({
+            startOnLoad: true,
+            theme: 'dark',
+            themeVariables: {
+                darkMode: true,
+                background: '#161b22',
+                primaryColor: '#58a6ff',
+                primaryTextColor: '#c9d1d9',
+                primaryBorderColor: '#30363d',
+                lineColor: '#8b949e',
+                secondaryColor: '#21262d',
+                tertiaryColor: '#161b22'
+            }
+        });
+    </script>
+</body>
+</html>

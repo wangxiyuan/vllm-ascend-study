@@ -1,0 +1,270 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>03 - 层发现机制 - NPUWorker::get_kv_cache_spec</title>
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/styles/github-dark.min.css">
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/highlight.min.js"></script>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/languages/python.min.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/mermaid@10/dist/mermaid.min.js"></script>
+    <link rel="stylesheet" href="../styles.css">
+</head>
+<body>
+    <div class="container">
+        <nav class="sidebar">
+            <a href="../index.html" class="back-to-home">← 返回主页</a>
+            <div class="sidebar-header">
+                <h1>NPUWorker::get_kv_cache_spec</h1>
+                <p>KV Cache 规范获取流程分析</p>
+            </div>
+            <div class="nav-section">
+                <div class="nav-section-title">文档目录</div>
+                <a href="index.html" class="nav-item"><span class="nav-item-number">00</span>概述</a>
+                <a href="01-entry-point.html" class="nav-item"><span class="nav-item-number">01</span>入口方法</a>
+                <a href="02-model-runner.html" class="nav-item"><span class="nav-item-number">02</span>ModelRunner 实现</a>
+                <a href="03-layer-discovery.html" class="nav-item active"><span class="nav-item-number">03</span>层发现机制</a>
+                <a href="04-attention-spec.html" class="nav-item"><span class="nav-item-number">04</span>Attention 规范</a>
+                <a href="05-mla-mamba-spec.html" class="nav-item"><span class="nav-item-number">05</span>MLA 与 Mamba 规范</a>
+                <a href="06-data-structures.html" class="nav-item"><span class="nav-item-number">06</span>数据结构定义</a>
+                <a href="07-summary.html" class="nav-item"><span class="nav-item-number">07</span>流程总结</a>
+            </div>
+        </nav>
+
+        <main class="main-content">
+            <h1>第三章：层发现机制</h1>
+
+            <h2>get_layers_from_vllm_config 函数</h2>
+            <div class="file-location">vllm/vllm/config/vllm.py:1731</div>
+
+            <pre><code class="language-python">T = TypeVar("T")
+
+
+def get_layers_from_vllm_config(
+    vllm_config: VllmConfig,
+    layer_type: type[T],
+    layer_names: list[str] | None = None,
+) -> dict[str, T]:
+    """
+    Get layers from the vLLM config.
+
+    Args:
+        vllm_config: The vLLM config.
+        layer_type: The type of the layer to get.
+        layer_names: The names of the layers to get. If None, return all layers.
+    """
+
+    if layer_names is None:
+        layer_names = list(vllm_config.compilation_config.static_forward_context.keys())
+
+    forward_context = vllm_config.compilation_config.static_forward_context
+
+    return {
+        layer_name: forward_context[layer_name]
+        for layer_name in layer_names
+        if isinstance(forward_context[layer_name], layer_type)
+    }</code></pre>
+
+            <h2>函数分析</h2>
+
+            <h3>参数说明</h3>
+
+            <table>
+                <thead>
+                    <tr>
+                        <th>参数</th>
+                        <th>类型</th>
+                        <th>描述</th>
+                    </tr>
+                </thead>
+                <tbody>
+                    <tr>
+                        <td><code>vllm_config</code></td>
+                        <td>VllmConfig</td>
+                        <td>vLLM 配置对象，包含所有配置信息</td>
+                    </tr>
+                    <tr>
+                        <td><code>layer_type</code></td>
+                        <td>type[T]</td>
+                        <td>要获取的层类型，支持泛型</td>
+                    </tr>
+                    <tr>
+                        <td><code>layer_names</code></td>
+                        <td>list[str] | None</td>
+                        <td>要获取的层名列表，为 None 时返回所有匹配层</td>
+                    </tr>
+                </tbody>
+            </table>
+
+            <h3>static_forward_context</h3>
+            <p>
+                <code>static_forward_context</code> 是 <code>CompilationConfig</code> 中的一个字典，
+                它在模型加载时被填充，存储了所有需要在前向传播中访问的层对象。
+            </p>
+
+            <div class="diagram">+---------------------------+
+|    CompilationConfig      |
++---------------------------+
+| static_forward_context:   |
+|   dict[str, nn.Module]    |
++---------------------------+
+            |
+            | 包含的层示例
+            v
++---------------------------+
+| "model.layers.0.self_attn"| -> Attention 对象
+| "model.layers.1.self_attn"| -> Attention 对象
+| "model.layers.2.mamba"    | -> Mamba 对象
+| ...                       |
++---------------------------+</div>
+
+            <h2>AttentionLayerBase 基类</h2>
+            <div class="file-location">vllm/vllm/model_executor/layers/attention_layer_base.py</div>
+
+            <pre><code class="language-python">class AttentionLayerBase(ABC):
+    """
+    Base class for attention-like layers (Attention, Mamba, etc.)
+    that support the v1 engine.
+
+    This provides a common interface for getting attention backends
+    from different layer types.
+    """
+
+    impl: "AttentionImpl"
+
+    @abstractmethod
+    def get_attn_backend(self) -> type[AttentionBackend]:
+        """Get the attention backend class for this layer."""
+        pass
+
+    @abstractmethod
+    def get_kv_cache_spec(self, vllm_config: VllmConfig) -> KVCacheSpec | None:
+        """
+        Get the KV cache spec for this layer.
+        May be None if the layer does not need KV cache.
+        """
+        pass</code></pre>
+
+            <h2>继承关系</h2>
+
+            <div class="diagram">                AttentionLayerBase (ABC)
+                        |
+         +--------------+--------------+----------------+
+         |              |              |                |
+    Attention     MLAAttention   MambaBase        其他实现
+         |              |              |
+         v              v              v
+   标准注意力       MLA注意力      Mamba 层
+   (Transformer)   (DeepSeek)     (状态空间模型)</div>
+
+            <h2>类型筛选流程</h2>
+
+            <div class="mermaid">
+            sequenceDiagram
+                participant Caller as 调用者
+                participant Func as get_layers_from_vllm_config
+                participant Context as static_forward_context
+                participant Layer as 层对象
+
+                Caller->>Func: 调用(vllm_config, AttentionLayerBase)
+                Func->>Context: 获取所有层名
+                Context-->>Func: ["layer.0.attn", "layer.1.attn", ...]
+
+                loop 每个层名
+                    Func->>Context: 获取层对象
+                    Context->>Layer: 返回层对象
+                    Func->>Func: isinstance(layer, AttentionLayerBase)?
+                    alt 类型匹配
+                        Func->>Func: 添加到结果字典
+                    else 类型不匹配
+                        Func->>Func: 跳过
+                    end
+                end
+
+                Func-->>Caller: 返回 {layer_name: layer, ...}
+            </div>
+
+            <h2>实际使用示例</h2>
+
+            <p>在 <code>NPUModelRunner.get_kv_cache_spec</code> 中的调用：</p>
+
+            <pre><code class="language-python"># 获取所有 AttentionLayerBase 类型的层
+attn_layers = get_layers_from_vllm_config(self.vllm_config, AttentionLayerBase)
+
+# 返回的字典结构示例：
+# {
+#     "model.layers.0.self_attn": Attention(...),
+#     "model.layers.1.self_attn": Attention(...),
+#     "model.layers.2.mamba": Mamba(...),
+#     ...
+# }</code></pre>
+
+            <div class="highlight-box">
+                <h4>关键设计</h4>
+                <p>
+                    <code>AttentionLayerBase</code> 作为抽象基类，定义了所有注意力类层的公共接口。
+                    这使得 <code>get_layers_from_vllm_config</code> 可以一次性获取所有类型的注意力层，
+                    然后在遍历时通过 <code>isinstance</code> 进行具体类型判断和处理。
+                </p>
+            </div>
+
+            <h2>层注册机制</h2>
+
+            <p>
+                层是如何被注册到 <code>static_forward_context</code> 中的？
+                这发生在层初始化时。
+            </p>
+
+            <div class="file-location">vllm/vllm/model_executor/layers/attention/attention.py:340</div>
+
+            <pre><code class="language-python">class Attention(nn.Module, AttentionLayerBase):
+    def __init__(
+        self,
+        ...
+        prefix: str = "",
+        ...
+    ) -> None:
+        ...
+        compilation_config = vllm_config.compilation_config
+        if prefix in compilation_config.static_forward_context:
+            raise ValueError(f"Duplicate layer name: {prefix}")
+        compilation_config.static_forward_context[prefix] = self
+        ...</code></pre>
+
+            <p>
+                每个 Attention 层在初始化时，会将自身注册到 <code>static_forward_context</code> 中，
+                使用 <code>prefix</code>（即层名）作为键。
+            </p>
+
+            <div class="chapter-nav">
+                <a href="02-model-runner.html" class="prev-chapter">
+                    <span class="nav-label">上一章</span>
+                    <span class="nav-title">← ModelRunner 实现</span>
+                </a>
+                <a href="04-attention-spec.html" class="next-chapter">
+                    <span class="nav-label">下一章</span>
+                    <span class="nav-title">Attention 规范 →</span>
+                </a>
+            </div>
+        </main>
+    </div>
+
+    <script>
+        hljs.highlightAll();
+        mermaid.initialize({
+            startOnLoad: true,
+            theme: 'dark',
+            themeVariables: {
+                darkMode: true,
+                background: '#161b22',
+                primaryColor: '#58a6ff',
+                primaryTextColor: '#c9d1d9',
+                primaryBorderColor: '#30363d',
+                lineColor: '#8b949e',
+                secondaryColor: '#21262d',
+                tertiaryColor: '#161b22'
+            }
+        });
+    </script>
+</body>
+</html>
