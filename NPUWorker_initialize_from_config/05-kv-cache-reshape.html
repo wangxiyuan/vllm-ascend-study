@@ -1,0 +1,364 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>05 - 特殊注意力机制支持 - NPUWorker.initialize_from_config</title>
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/styles/github-dark.min.css">
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/highlight.min.js"></script>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/languages/python.min.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/mermaid@10/dist/mermaid.min.js"></script>
+    <link rel="stylesheet" href="../styles.css">
+</head>
+<body>
+    <div class="container">
+        <nav class="sidebar">
+            <a href="../index.html" class="back-to-home">← 返回主页</a>
+            <div class="sidebar-header">
+                <h1>NPUWorker::initialize_from_config</h1>
+                <p>KV Cache 初始化流程分析</p>
+            </div>
+            <div class="nav-section">
+                <div class="nav-section-title">文档目录</div>
+                <a href="index.html" class="nav-item"><span class="nav-item-number">00</span>概述</a>
+                <a href="01-entry-point.html" class="nav-item"><span class="nav-item-number">01</span>入口方法</a>
+                <a href="02-kv-cache-init.html" class="nav-item"><span class="nav-item-number">02</span>KV Cache 初始化</a>
+                <a href="03-attn-backend.html" class="nav-item"><span class="nav-item-number">03</span>Attention Backend</a>
+                <a href="04-kv-cache-alloc.html" class="nav-item"><span class="nav-item-number">04</span>KV Cache 分配</a>
+                <a href="05-kv-cache-reshape.html" class="nav-item active"><span class="nav-item-number">05</span>KV Cache 重塑</a>
+                <a href="06-special-attn.html" class="nav-item"><span class="nav-item-number">06</span>特殊注意力支持</a>
+                <a href="07-kv-bind.html" class="nav-item"><span class="nav-item-number">07</span>KV Cache 绑定</a>
+                <a href="08-summary.html" class="nav-item"><span class="nav-item-number">08</span>流程总结</a>
+            </div>
+        </nav>
+
+        <main class="main-content">
+            <h1>05 - 特殊注意力机制支持</h1>
+
+            <p>在 vLLM Ascend 中，除了标准的 Attention 机制外，还支持多种特殊的注意力机制，包括 MLA（Multi-Latent Attention）、稀疏注意力（Sparse Attention）和 Mamba 线性注意力。本章将详细分析这些特殊注意力机制的 KV Cache 处理方式。</p>
+
+            <h2>5.1 MLA（Multi-Latent Attention）支持</h2>
+
+            <div class="file-location">vllm_ascend/worker/model_runner_v1.py:2540</div>
+
+            <h3>MLA 简介</h3>
+
+            <p>MLA 是 DeepSeek 模型采用的注意力机制，通过将 KV Cache 分为两个低秩潜在空间来减少内存占用：</p>
+            <ul>
+                <li><strong>NoPE Cache</strong>：无位置编码的潜在向量，维度为 <code>kv_lora_rank</code></li>
+                <li><strong>RoPE Cache</strong>：带旋转位置编码的向量，维度为 <code>qk_rope_head_dim</code></li>
+            </ul>
+
+            <h3>MLA 内存分配</h3>
+
+            <pre><code class="language-python">if self.model_config.use_mla:
+    # 计算总 head size（NoPE + RoPE）
+    head_size = (
+        self.model_config.hf_text_config.qk_rope_head_dim
+        + self.model_config.hf_text_config.kv_lora_rank
+    )
+
+# 对于 MLA 模型，K/V 分割比例根据 head dim 计算
+k_tensor_split_factor = head_size / self.model_config.hf_text_config.kv_lora_rank
+v_tensor_split_factor = head_size / self.model_config.hf_text_config.qk_rope_head_dim</code></pre>
+
+            <div class="mermaid">
+flowchart TD
+    subgraph MLA Structure
+        A[Hidden States] --> B[Multi-Latent Projection]
+        B --> C[NoPE Branch]
+        B --> D[RoPE Branch]
+        C --> E[kv_lora_rank<br/>~512 dim]
+        D --> F[qk_rope_head_dim<br/>~64-128 dim]
+        E --> G[NoPE Cache]
+        F --> H[RoPE Cache]
+    end
+
+    style G fill:#58a6ff,color:#fff
+    style H fill:#f0f6fc,color:#333
+            </div>
+
+            <h3>MLA KV Cache 形状重塑</h3>
+
+            <pre><code class="language-python"># MLA 模型：K Cache (NoPE) 和 V Cache (RoPE) 形状不同
+mla_num_blocks, mla_block_size, num_kv_heads, _ = kv_cache_shape
+
+# k_cache: nope_cache (kv_lora_rank)
+k_shape = [
+    mla_num_blocks,
+    mla_block_size,
+    num_kv_heads,
+    self.model_config.hf_text_config.kv_lora_rank,
+]
+
+# v_cache: rope_cache (qk_rope_head_dim)
+v_shape = [
+    mla_num_blocks,
+    mla_block_size,
+    num_kv_heads,
+    self.model_config.hf_text_config.qk_rope_head_dim,
+]
+
+# 执行视图转换
+k_cache = raw_k_tensor.view(dtype).view(k_shape)
+v_cache = raw_v_tensor.view(dtype).view(v_shape)</code></pre>
+
+            <div class="ascend-specific">
+                <h4>MLA 的优势</h4>
+                <p>相比于标准 Attention，MLA 通过低秩分解显著减少了 KV Cache 的内存占用：</p>
+                <ul>
+                    <li><strong>标准 Attention</strong>：KV Cache = 2 × num_kv_heads × head_size（通常 head_size=256）</li>
+                    <li><strong>MLA</strong>：KV Cache = kv_lora_rank + qk_rope_head_dim（通常 512+64=576）</li>
+                </ul>
+                <p>对于 DeepSeek V2/V3 等模型，head_size 可能达到 512 或更高，MLA 可以节省约 50% 的 KV Cache 内存。</p>
+            </div>
+
+            <h2>5.2 稀疏注意力（Sparse Attention）支持</h2>
+
+            <div class="file-location">vllm_ascend/worker/model_runner_v1.py:2552</div>
+
+            <h3>稀疏注意力简介</h3>
+
+            <p>稀疏注意力是 DeepSeek V3.2 引入的注意力机制，通过将注意力头分为不同的组，每组使用不同的 KV Cache 策略，进一步减少内存占用。</p>
+
+            <h3>稀疏 KV Cache 比例</h3>
+
+            <pre><code class="language-python">elif self.use_sparse:
+    # DeepSeek V3.2: 根据稀疏比例分割 KV Cache
+    sparse_sum_head_size = sum(self._get_sparse_kv_cache_ratio())
+
+    # 计算 K/V/DSA_K 的分割因子
+    k_tensor_split_factor, v_tensor_split_factor, dsa_k_cache_factor = [
+        sparse_sum_head_size / ratio
+        for ratio in self._get_sparse_kv_cache_ratio()
+    ]
+
+    # 计算 DSA K Cache 大小
+    dsa_k_cache_size = int(kv_cache_tensor.size // dsa_k_cache_factor)</code></pre>
+
+            <h3>稀疏注意力分配流程</h3>
+
+            <div class="mermaid">
+flowchart LR
+    subgraph Sparse Attention
+        A[Total Heads] --> B[Head Groups]
+        B --> C[Group 1<br/>Dense]
+        B --> D[Group 2<br/>Sparse]
+        B --> E[Group 3<br/>RoPE Only]
+        C --> F[Full KV Cache]
+        D --> G[Reduced KV]
+        E --> H[RoPE Only]
+        F --> I[DSA K Cache]
+        G --> I
+        H --> I
+    end
+            </div>
+
+            <h3>DSA K Cache 处理</h3>
+
+            <pre><code class="language-python"># 分配 DSA K Cache 张量（如果启用稀疏注意力）
+if dsa_k_cache_factor is not None:
+    # 无 KV Transfer
+    if self.vllm_config.kv_transfer_config is None:
+        dsa_k_cache_tensor = torch.zeros(
+            dsa_k_cache_size, dtype=torch.int8, device=self.device
+        )
+    else:
+        # 有 KV Transfer：需要 2M 对齐
+        dsa_k_cache_tensor = torch.zeros(
+            dsa_k_cache_size + alignment, dtype=torch.int8, device=self.device
+        )
+        dsa_k_cache_tensor = self._align_memory(
+            dsa_k_cache_tensor, alignment
+        )[:dsa_k_cache_size]
+
+# 重塑 DSA K Cache
+if self.use_sparse and raw_dsa_k_tensor is not None:
+    index_head_dim = self._get_sparse_kv_cache_ratio()[-1]
+    dsa_k_cache_shape = (
+        num_blocks,
+        kv_cache_spec.block_size,
+        kv_cache_spec.num_kv_heads,
+        index_head_dim,
+    )
+    dsa_k_cache = raw_dsa_k_tensor.view(dtype).view(dsa_k_cache_shape)
+    kv_caches[layer_name] = (k_cache, v_cache, dsa_k_cache)</code></pre>
+
+            <div class="highlight-box">
+                <h4>稀疏 KV Cache 比例</h4>
+                <p><code>_get_sparse_kv_cache_ratio()</code> 返回一个三元组，表示 K/V/DSA_K 的头维度比例。例如：</p>
+                <pre><code>[128, 128, 64]  # K: 128 heads, V: 128 heads, DSA_K: 64 heads</code></pre>
+                <p>总和为 320，意味着 K/V 各占总内存的 128/320 = 40%，DSA_K 占 20%。</p>
+            </div>
+
+            <h2>5.3 Mamba 线性注意力支持</h2>
+
+            <div class="file-location">vllm_ascend/worker/model_runner_v1.py:2521</div>
+
+            <h3>Mamba 简介</h3>
+
+            <p>Mamba 是一种状态空间模型（SSM），使用线性注意力机制替代传统的 Transformer 注意力。它的 KV Cache 结构完全不同，包含卷积状态（conv_state）和 SSM 状态（ssm_state）。</p>
+
+            <h3>Mamba KV Cache 分配</h3>
+
+            <pre><code class="language-python">if "linear_attn" in layer_name and layer_name not in kv_cache_raw_tensors:
+    # for mamba linear attention
+    if self.vllm_config.kv_transfer_config is None:
+        # 无 KV Transfer：直接分配
+        tensor = torch.zeros(kv_cache_tensor.size, dtype=torch.int8, device=self.device)
+    else:
+        # 有 KV Transfer：需要 2M 对齐
+        cache_size_aligned = kv_cache_tensor.size + alignment
+        tensor = torch.zeros(cache_size_aligned, dtype=torch.int8, device=self.device)
+        tensor = self._align_memory(tensor, alignment)[: kv_cache_tensor.size]
+
+    # 在同一个组内的所有 linear_attn 层共享该张量
+    for layer_name_inner in kv_cache_tensor.shared_by:
+        if "linear_attn" in layer_name_inner:
+            kv_cache_raw_tensors[layer_name_inner] = tensor</code></pre>
+
+            <h3>MambaSpec 重塑流程</h3>
+
+            <pre><code class="language-python">elif isinstance(kv_cache_spec, MambaSpec):
+    raw_tensor = kv_cache_raw_tensors[layer_name]
+    assert raw_tensor is not None
+    assert raw_tensor.numel() % kv_cache_spec.page_size_bytes == 0
+
+    num_blocks = raw_tensor.numel() // kv_cache_spec.page_size_bytes
+    assert num_blocks >= kv_cache_config.num_blocks
+
+    # Mamba 状态张量列表
+    state_tensors = []
+    target_idx = 0
+    start_idx = 0
+
+    # 遍历所有状态形状和数据类型
+    # 正常情况下，这个循环包含 conv state 和 ssm state
+    # 某些特殊模型可能只有 conv state
+    for shape, dtype in zip(kv_cache_spec.shapes, kv_cache_spec.dtypes):
+        target_shape = (num_blocks, *shape)
+
+        # 计算目标索引位置
+        target_idx += torch.prod(torch.tensor(target_shape)).item()
+
+        # 从原始张量中切片出当前状态张量
+        tensor = raw_tensor.view(dtype)[start_idx:target_idx].view(target_shape)
+        start_idx = target_idx
+
+        state_tensors.append(tensor)
+
+    # 返回状态张量列表
+    kv_caches[layer_name] = state_tensors</code></pre>
+
+            <div class="mermaid">
+flowchart TD
+    subgraph Mamba KV Cache
+        A[raw_tensor<br/>int8 buffer] --> B[Parse MambaSpec]
+        B --> C[shapes: list of tuples]
+        B --> D[dtypes: list of dtypes]
+        C --> E[For each state]
+        D --> E
+        E --> F{State Type?}
+        F -->|conv_state| G[conv_state tensor]
+        F -->|ssm_state| H[ssm_state tensor]
+        G --> I[state_tensors list]
+        H --> I
+    end
+
+    style A fill:#58a6ff,color:#fff
+    style I fill:#3fb950,color:#fff
+            </div>
+
+            <h2>5.4 跨层 KV Cache 共享</h2>
+
+            <div class="file-location">vllm_ascend/worker/model_runner_v1.py:2486</div>
+
+            <p>某些模型架构中，不同的层可能共享相同的 KV Cache。这种机制可以减少重复内存分配，提高内存效率。</p>
+
+            <pre><code class="language-python"># Set up cross-layer KV cache sharing
+for layer_name, target_layer_name in self.shared_kv_cache_layers.items():
+    logger.debug("%s reuses KV cache of %s", layer_name, target_layer_name)
+    kv_caches[layer_name] = kv_caches[target_layer_name]</code></pre>
+
+            <div class="highlight-box">
+                <h4>共享机制说明</h4>
+                <p><code>shared_kv_cache_layers</code> 是一个字典，键为当前层名，值为目标层名。通过这种方式，多个层可以共享同一块 KV Cache 内存，适用于以下场景：</p>
+                <ul>
+                    <li><strong>循环结构</strong>：某些模型使用循环层，多次复用同一层权重</li>
+                    <li><strong>编码器 - 解码器共享</strong>：某些架构中编码器和解码器共享 KV Cache</li>
+                </ul>
+            </div>
+
+            <h2>5.5 Ascend 特定优化总结</h2>
+
+            <div class="ascend-specific">
+                <h4>vllm-ascend 的特殊注意力支持</h4>
+                <table>
+                    <thead>
+                        <tr>
+                            <th>注意力类型</th>
+                            <th>支持模型</th>
+                            <th>KV Cache 特点</th>
+                        </tr>
+                    </thead>
+                    <tbody>
+                        <tr>
+                            <td>Standard Attention</td>
+                            <td>Llama, Qwen, etc.</td>
+                            <td>K/V 对称，2M 对齐</td>
+                        </tr>
+                        <tr>
+                            <td>MLA</td>
+                            <td>DeepSeek V2/V3</td>
+                            <td>NoPE/RoPE 分离</td>
+                        </tr>
+                        <tr>
+                            <td>Sparse Attention</td>
+                            <td>DeepSeek V3.2</td>
+                            <td>DSA K Cache 三元组</td>
+                        </tr>
+                        <tr>
+                            <td>Linear Attention</td>
+                            <td>Mamba, Jamba</td>
+                            <td>State tensors 列表</td>
+                        </tr>
+                    </tbody>
+                </table>
+            </div>
+
+            <div class="chapter-nav">
+                <a href="04-kv-cache-reshape.html">
+                    <div style="text-align: left;">
+                        <div class="nav-label">Previous Chapter</div>
+                        <div class="nav-title">← KV Cache 张量重塑</div>
+                    </div>
+                </a>
+                <a href="06-kv-bind.html">
+                    <div style="text-align: right;">
+                        <div class="nav-label">Next Chapter</div>
+                        <div class="nav-title">KV Cache 绑定与注册 →</div>
+                    </div>
+                </a>
+            </div>
+        </main>
+    </div>
+
+    <script>
+        hljs.highlightAll();
+        mermaid.initialize({
+            startOnLoad: true,
+            theme: 'dark',
+            themeVariables: {
+                darkMode: true,
+                background: '#161b22',
+                primaryColor: '#58a6ff',
+                primaryTextColor: '#c9d1d9',
+                primaryBorderColor: '#30363d',
+                lineColor: '#8b949e',
+                secondaryColor: '#21262d',
+                tertiaryColor: '#161b22'
+            }
+        });
+    </script>
+</body>
+</html>

@@ -1,0 +1,318 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>06 - KV Cache 绑定与注册 - NPUWorker.initialize_from_config</title>
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/styles/github-dark.min.css">
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/highlight.min.js"></script>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/languages/python.min.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/mermaid@10/dist/mermaid.min.js"></script>
+    <link rel="stylesheet" href="../styles.css">
+</head>
+<body>
+    <div class="container">
+        <nav class="sidebar">
+            <a href="../index.html" class="back-to-home">← 返回主页</a>
+            <div class="sidebar-header">
+                <h1>NPUWorker::initialize_from_config</h1>
+                <p>KV Cache 初始化流程分析</p>
+            </div>
+            <div class="nav-section">
+                <div class="nav-section-title">文档目录</div>
+                <a href="index.html" class="nav-item"><span class="nav-item-number">00</span>概述</a>
+                <a href="01-entry-point.html" class="nav-item"><span class="nav-item-number">01</span>入口方法</a>
+                <a href="02-kv-cache-init.html" class="nav-item"><span class="nav-item-number">02</span>KV Cache 初始化</a>
+                <a href="03-attn-backend.html" class="nav-item"><span class="nav-item-number">03</span>Attention Backend</a>
+                <a href="04-kv-cache-alloc.html" class="nav-item"><span class="nav-item-number">04</span>KV Cache 分配</a>
+                <a href="05-kv-cache-reshape.html" class="nav-item"><span class="nav-item-number">05</span>KV Cache 重塑</a>
+                <a href="06-special-attn.html" class="nav-item active"><span class="nav-item-number">06</span>特殊注意力支持</a>
+                <a href="07-kv-bind.html" class="nav-item"><span class="nav-item-number">07</span>KV Cache 绑定</a>
+                <a href="08-summary.html" class="nav-item"><span class="nav-item-number">08</span>流程总结</a>
+            </div>
+        </nav>
+
+        <main class="main-content">
+            <h1>06 - KV Cache 绑定与注册</h1>
+
+            <p>在 KV Cache 张量分配和重塑完成后，需要将这些张量绑定到模型的前后文中，以便在推理过程中使用。此外，如果启用了 KV Transfer 功能，还需要注册 KV Cache 到传输组。</p>
+
+            <h2>6.1 initialize_kv_cache_tensors 完成流程</h2>
+
+            <div class="file-location">vllm_ascend/worker/model_runner_v1.py:2471</div>
+
+            <pre><code class="language-python">def initialize_kv_cache_tensors(self, kv_cache_config: KVCacheConfig) -> dict[str, torch.Tensor]:
+    """
+    Initialize the memory buffer for KV cache.
+
+    Args:
+        kv_cache_config: The KV cache config
+    Returns:
+        Dict[str, torch.Tensor]: A map between layer names to their
+        corresponding memory buffer for KV cache.
+    """
+    # 1. 初始化 KV Cache 内存缓冲区
+    kv_cache_raw_tensors = self._allocate_kv_cache_tensors(kv_cache_config)
+
+    # 2. 将缓冲区重塑为所需的形状
+    kv_caches = self._reshape_kv_cache_tensors(kv_cache_config, kv_cache_raw_tensors)
+
+    # 3. 设置跨层 KV Cache 共享
+    for layer_name, target_layer_name in self.shared_kv_cache_layers.items():
+        logger.debug("%s reuses KV cache of %s", layer_name, target_layer_name)
+        kv_caches[layer_name] = kv_caches[target_layer_name]
+
+    # 4. 绑定 KV Cache 到模型前后文
+    from vllm.v1.worker.utils import bind_kv_cache
+
+    num_attn_module = 2 if self.model_config.hf_text_config.model_type == "longcat_flash" else 1
+    bind_kv_cache(
+        kv_caches,
+        self.compilation_config.static_forward_context,
+        self.kv_caches,
+        num_attn_module
+    )
+
+    return kv_caches</code></pre>
+
+            <h2>6.2 bind_kv_cache 函数详解</h2>
+
+            <div class="file-location">vllm/vllm/v1/worker/utils.py:271</div>
+
+            <h3>函数签名与职责</h3>
+
+            <pre><code class="language-python">def bind_kv_cache(
+    kv_caches: dict[str, torch.Tensor],
+    forward_context: dict[str, Attention],
+    runner_kv_caches: list[torch.Tensor],
+    num_attn_module: int = 1,
+) -> None:
+    """
+    Bind the allocated KV cache to both ModelRunner and forward context so
+    that the KV cache can be used in the forward pass.
+
+    This function:
+      1) Fills the ModelRunner's kv cache list (`runner_kv_caches`) with
+         kv_caches.
+      2) Associates each attention layer in the `forward_context` with its
+         corresponding KV cache in kv_caches.
+
+    Args:
+        kv_caches: The allocated kv_caches with layer names as keys.
+        forward_context: The global forward context containing all Attention
+            layers with layer names as keys.
+        runner_kv_caches: The kv_cache declared by ModelRunner.
+        num_attn_module: Number of attention modules per layer (1 for standard,
+            2 for encoder-decoder models like longcat_flash)
+    """</code></pre>
+
+            <div class="highlight-box">
+                <h4>bind_kv_cache 的双重职责</h4>
+                <ol>
+                    <li><strong>填充 ModelRunner 的 KV Cache 列表</strong>：将按层组织的 KV Cache 张量转换为按索引排序的列表</li>
+                    <li><strong>绑定到前后文</strong>：将每个 Attention 层与对应的 KV Cache 关联，以便在 forward  pass 中访问</li>
+                </ol>
+            </div>
+
+            <h3>步骤 1：绑定到 ModelRunner</h3>
+
+            <pre><code class="language-python"># Bind kv_caches to ModelRunner
+assert len(runner_kv_caches) == 0
+
+# Convert kv_caches dict to a list of tensors in the order of layer_index.
+index2name = defaultdict(list)
+for layer_name in kv_caches:
+    index2name[extract_layer_index(layer_name, num_attn_module)].append(layer_name)
+
+# 按层索引排序并添加到 runner_kv_caches
+for layer_index in sorted(index2name.keys()):
+    layer_names = index2name[layer_index]
+
+    # 处理同一层有多个注意力模块的情况（如编码器 - 解码器模型）
+    if len(layer_names) > 1:
+        # One typical case is encoder-decoder model, e.g., bart.
+        # The cross attention and self attention in the same decoder layer
+        # has different layer_name but the same layer_index.
+        if (
+            current_platform.is_cuda_alike()
+            or current_platform.is_xpu()
+            or current_platform.is_cpu()
+        ):
+            # GPU/CPU runner 不受影响，测试代码依赖于 runner_kv_caches
+            pass
+        else:
+            raise NotImplementedError
+
+    # 将该层的所有 KV Cache 添加到列表
+    for layer_name in layer_names:
+        runner_kv_caches.append(kv_caches[layer_name])</code></pre>
+
+            <div class="mermaid">
+flowchart TD
+    A[kv_caches dict] --> B[Build index2name]
+    B --> C[For each layer_index]
+    C --> D{Multiple attn?}
+    D -->|Yes| E[Handle encoder-decoder]
+    D -->|No| F[Append to list]
+    E --> F
+    F --> G[runner_kv_caches list]
+
+    style A fill:#58a6ff,color:#fff
+    style G fill:#3fb950,color:#fff
+            </div>
+
+            <h3>extract_layer_index 函数</h3>
+
+            <p><code>extract_layer_index</code> 从层名中提取层索引。层名通常遵循以下格式：</p>
+            <ul>
+                <li><code>model.layers.0.self_attn</code> → layer_index = 0</li>
+                <li><code>model.layers.1.cross_attn</code> → layer_index = 1</li>
+            </ul>
+
+            <pre><code class="language-python"># 示例：层名到索引的映射
+# "model.layers.0.self_attn" → 0
+# "model.layers.1.self_attn" → 1
+# "model.layers.10.self_attn" → 10</code></pre>
+
+            <h3>步骤 2：绑定到前后文</h3>
+
+            <pre><code class="language-python"># Bind kv_caches to forward context
+for layer_name, kv_cache in kv_caches.items():
+    # NOTE: Use list because of v0 PP virtual engine.
+    forward_context[layer_name].kv_cache = [kv_cache]</code></pre>
+
+            <p>这一步将 KV Cache 直接绑定到每个 Attention 层的 <code>kv_cache</code> 属性上。在模型的前向传播中，Attention 层会通过这个属性访问 KV Cache。</p>
+
+            <div class="highlight-box">
+                <h4>为什么使用列表？</h4>
+                <p><code>kv_cache</code> 被赋值为一个列表 <code>[kv_cache]</code> 而不是单个张量。这是为了支持 v0 版本的 Pipeline Parallelism 虚拟引擎，该引擎可能在同一层使用多个 KV Cache。</p>
+            </div>
+
+            <h2>6.3 KV Transfer 注册</h2>
+
+            <div class="file-location">vllm_ascend/worker/model_runner_v1.py:2459</div>
+
+            <p>如果启用了 KV Transfer 功能（用于分布式推理中的 KV Cache 传输），需要将 KV Cache 注册到传输组。</p>
+
+            <pre><code class="language-python"># 在 initialize_kv_cache 中
+kv_caches = self.initialize_kv_cache_tensors(kv_cache_config)
+
+# 注册 KV Cache 到 KV Transfer 组（如果启用）
+if has_kv_transfer_group():
+    get_kv_transfer_group().register_kv_caches(kv_caches)</code></pre>
+
+            <h3>KV Transfer 的作用</h3>
+
+            <p>KV Transfer 用于在以下场景中高效传输 KV Cache：</p>
+            <ul>
+                <li><strong>Prefill Disaggregation</strong>：将 Prefill 阶段生成的 KV Cache 传输到解码设备</li>
+                <strong>分布式推理</strong>：在多个设备间共享 KV Cache</li>
+                <li><strong>KV Cache 卸载</strong>：将 KV Cache 卸载到 CPU 或其他存储介质</li>
+            </ul>
+
+            <div class="mermaid">
+sequenceDiagram
+    participant Runner as NPUModelRunner
+    participant Transfer as KV Transfer Group
+    participant Network as Network Layer
+
+    Runner->>Transfer: register_kv_caches(kv_caches)
+    Note over Transfer: 注册 KV Cache 元数据
+    Note over Transfer: 建立传输通道
+
+    loop 推理过程
+        Runner->>Transfer: send_kv(layer, tokens)
+        Transfer->>Network: 传输 KV Cache
+        Network->>Transfer: 远端设备
+    end
+            </div>
+
+            <h2>6.4 路由专家捕获器初始化</h2>
+
+            <div class="file-location">vllm_ascend/worker/model_runner_v1.py:2462</div>
+
+            <p>如果启用了返回路由专家（Return Routed Experts）功能，需要初始化捕获器来跟踪专家路由信息。</p>
+
+            <pre><code class="language-python"># 初始化路由专家捕获器（如果启用）
+if self.model_config.enable_return_routed_experts:
+    self.init_routed_experts_capturer()</code></pre>
+
+            <p>这个功能主要用于 MoE（Mixture of Experts）模型，用于跟踪和返回每个 token 被路由到哪些专家。</p>
+
+            <h2>6.5 完整调用链总结</h2>
+
+            <div class="diagram">┌─────────────────────────────────────────────────────────────┐
+│        initialize_kv_cache_tensors (完整流程)                │
+└─────────────────────┬───────────────────────────────────────┘
+                      │
+                      ▼
+         ┌────────────────────────┐
+         │ _allocate_kv_cache_    │
+         │       tensors          │
+         │  - 分配原始 int8 缓冲区   │
+         │  - 2M 内存对齐           │
+         └──────────┬─────────────┘
+                    │
+                    ▼
+         ┌────────────────────────┐
+         │ _reshape_kv_cache_     │
+         │      tensors           │
+         │  - 转换为正确形状       │
+         │  - 处理 MLA/稀疏/Mamba │
+         └──────────┬─────────────┘
+                    │
+                    ▼
+         ┌────────────────────────┐
+         │ 跨层 KV Cache 共享      │
+         │ shared_kv_cache_layers │
+         └──────────┬─────────────┘
+                    │
+                    ▼
+         ┌────────────────────────┐
+         │    bind_kv_cache       │
+         │  - 绑定到 ModelRunner  │
+         │  - 绑定到前后文        │
+         └──────────┬─────────────┘
+                    │
+                    ▼
+         ┌────────────────────────┐
+         │   KV Transfer 注册     │
+         │  (如果启用)            │
+         └────────────────────────┘</div>
+
+            <div class="chapter-nav">
+                <a href="05-special-attn.html">
+                    <div style="text-align: left;">
+                        <div class="nav-label">Previous Chapter</div>
+                        <div class="nav-title">← 特殊注意力机制支持</div>
+                    </div>
+                </a>
+                <a href="07-summary.html">
+                    <div style="text-align: right;">
+                        <div class="nav-label">Next Chapter</div>
+                        <div class="nav-title">总结 →</div>
+                    </div>
+                </a>
+            </div>
+        </main>
+    </div>
+
+    <script>
+        hljs.highlightAll();
+        mermaid.initialize({
+            startOnLoad: true,
+            theme: 'dark',
+            themeVariables: {
+                darkMode: true,
+                background: '#161b22',
+                primaryColor: '#58a6ff',
+                primaryTextColor: '#c9d1d9',
+                primaryBorderColor: '#30363d',
+                lineColor: '#8b949e',
+                secondaryColor: '#21262d',
+                tertiaryColor: '#161b22'
+            }
+        });
+    </script>
+</body>
+</html>

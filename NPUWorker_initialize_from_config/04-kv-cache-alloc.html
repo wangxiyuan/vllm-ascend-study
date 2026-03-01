@@ -1,0 +1,391 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>04 - KV Cache 张量重塑 - NPUWorker.initialize_from_config</title>
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/styles/github-dark.min.css">
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/highlight.min.js"></script>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/languages/python.min.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/mermaid@10/dist/mermaid.min.js"></script>
+    <link rel="stylesheet" href="../styles.css">
+</head>
+<body>
+    <div class="container">
+        <nav class="sidebar">
+            <a href="../index.html" class="back-to-home">← 返回主页</a>
+            <div class="sidebar-header">
+                <h1>NPUWorker::initialize_from_config</h1>
+                <p>KV Cache 初始化流程分析</p>
+            </div>
+            <div class="nav-section">
+                <div class="nav-section-title">文档目录</div>
+                <a href="index.html" class="nav-item"><span class="nav-item-number">00</span>概述</a>
+                <a href="01-entry-point.html" class="nav-item"><span class="nav-item-number">01</span>入口方法</a>
+                <a href="02-kv-cache-init.html" class="nav-item"><span class="nav-item-number">02</span>KV Cache 初始化</a>
+                <a href="03-attn-backend.html" class="nav-item"><span class="nav-item-number">03</span>Attention Backend</a>
+                <a href="04-kv-cache-alloc.html" class="nav-item active"><span class="nav-item-number">04</span>KV Cache 分配</a>
+                <a href="05-kv-cache-reshape.html" class="nav-item"><span class="nav-item-number">05</span>KV Cache 重塑</a>
+                <a href="06-special-attn.html" class="nav-item"><span class="nav-item-number">06</span>特殊注意力支持</a>
+                <a href="07-kv-bind.html" class="nav-item"><span class="nav-item-number">07</span>KV Cache 绑定</a>
+                <a href="08-summary.html" class="nav-item"><span class="nav-item-number">08</span>流程总结</a>
+            </div>
+        </nav>
+
+        <main class="main-content">
+            <h1>04 - KV Cache 张量重塑</h1>
+
+            <div class="file-location">vllm_ascend/worker/model_runner_v1.py:2605</div>
+
+            <h2>4.1 _reshape_kv_cache_tensors 方法概览</h2>
+
+            <p><code>_reshape_kv_cache_tensors</code> 方法将上一步分配的原始 int8 缓冲区转换为具有正确形状和数据类型的 KV Cache 张量。这个过程中，原始的一维字节数组被重塑为多维张量，以便模型能够正确访问和使用。</p>
+
+            <h3>方法签名</h3>
+
+            <pre><code class="language-python">def _reshape_kv_cache_tensors(
+    self,
+    kv_cache_config: KVCacheConfig,
+    kv_cache_raw_tensors: dict[str, torch.Tensor],
+) -> dict[str, torch.Tensor]:
+    """
+    Reshape the KV cache tensors to the desired shape and dtype.
+
+    Args:
+        kv_cache_config: The KV cache config
+        kv_cache_raw_tensors: The KV cache buffer of each layer, with
+            correct size but uninitialized shape.
+    Returns:
+        Dict[str, torch.Tensor]: A map between layer names to their
+        corresponding memory buffer for KV cache.
+    """</code></pre>
+
+            <h2>4.2 完整源码分析</h2>
+
+            <pre><code class="language-python">def _reshape_kv_cache_tensors(
+    self,
+    kv_cache_config: KVCacheConfig,
+    kv_cache_raw_tensors: dict[str, torch.Tensor],
+) -> dict[str, torch.Tensor]:
+    kv_caches: dict[str, torch.Tensor] = {}
+
+    # 1. 遍历所有 KV Cache 规范组
+    for group in self._kv_cache_spec_attn_group_iterator():
+        kv_cache_spec = group.kv_cache_spec
+        attn_backend = group.backend
+
+        # 2. 处理组内每一层
+        for layer_name in group.layer_names:
+            if layer_name in self.runner_only_attn_layers:
+                continue</code></pre>
+
+            <h2>4.3 AttentionSpec 处理流程</h2>
+
+            <h3>步骤 1：提取原始张量</h3>
+
+            <pre><code class="language-python">if isinstance(kv_cache_spec, AttentionSpec):
+    raw_dsa_k_tensor = None
+
+    # 稀疏注意力：提取 K/V/DSA_K 三个张量
+    if self.use_sparse:
+        raw_k_tensor, raw_v_tensor, raw_dsa_k_tensor = kv_cache_raw_tensors[layer_name]
+        assert raw_dsa_k_tensor is not None
+        sum_page_size_bytes = (
+            raw_k_tensor.numel() +
+            raw_v_tensor.numel() +
+            raw_dsa_k_tensor.numel()
+        )
+    # 标准注意力：提取 K/V 两个张量
+    else:
+        raw_k_tensor, raw_v_tensor = kv_cache_raw_tensors[layer_name]
+        sum_page_size_bytes = raw_k_tensor.numel() + raw_v_tensor.numel()
+
+    # 验证张量有效性
+    assert raw_k_tensor is not None
+    assert raw_v_tensor is not None
+    assert sum_page_size_bytes % kv_cache_spec.page_size_bytes == 0</code></pre>
+
+            <div class="highlight-box">
+                <h4>page_size_bytes 的含义</h4>
+                <p><code>page_size_bytes</code> 表示一个 KV Cache 块（page）所需的字节数。计算公式为：</p>
+                <pre><code>page_size_bytes = block_size × num_kv_heads × head_size × element_size(dtype)</code></pre>
+                <p>对于 MLA，还需要考虑 <code>kv_lora_rank</code> 和 <code>qk_rope_head_dim</code> 的分别计算。</p>
+            </div>
+
+            <h3>步骤 2：计算 num_blocks</h3>
+
+            <pre><code class="language-python"># 计算可以分配的 KV Cache 块数量
+num_blocks = sum_page_size_bytes // kv_cache_spec.page_size_bytes
+
+# 验证 num_blocks 不小于配置中指定的最小值
+# `num_blocks` is the number of blocks the model runner can use.
+# `kv_cache_config.num_blocks` is the number of blocks that
+# KVCacheManager may allocate.
+#
+# Since different GPUs may have different number of layers and
+# different memory capacities, `num_blocks` can be different on
+# different GPUs, and `kv_cache_config.num_blocks` is set to
+# the min of all `num_blocks`. Verify it here.
+assert num_blocks >= kv_cache_config.num_blocks</code></pre>
+
+            <div class="mermaid">
+flowchart TD
+    A[Raw K/V Tensors] --> B[Calculate sum_page_size_bytes]
+    B --> C[Divide by page_size_bytes]
+    C --> D[num_blocks]
+    D --> E{num_blocks >= config.num_blocks?}
+    E -->|Yes| F[Continue Processing]
+    E -->|No| G[Assertion Error]
+
+    style D fill:#58a6ff,color:#fff
+    style F fill:#3fb950,color:#fff
+    style G fill:#f85149,color:#fff
+            </div>
+
+            <h3>步骤 3：获取 KV Cache 形状</h3>
+
+            <pre><code class="language-python"># 根据 Backend 类型获取 KV Cache 形状
+if hasattr(attn_backend, "get_supported_kernel_block_sizes") and self.use_hybrid_blocks:
+    # 混合块模式：使用后端支持的 block size
+    block_size = attn_backend.get_supported_kernel_block_sizes()[0]
+    block_size_chunk = kv_cache_spec.block_size // block_size
+
+    kv_cache_shape = attn_backend.get_kv_cache_shape(
+        num_blocks * block_size_chunk,
+        block_size,
+        kv_cache_spec.num_kv_heads,
+        kv_cache_spec.head_size,
+    )
+else:
+    # 标准模式：使用标准 block size
+    kv_cache_shape = self.attn_backend.get_kv_cache_shape(
+        num_blocks,
+        kv_cache_spec.block_size,
+        kv_cache_spec.num_kv_heads,
+        kv_cache_spec.head_size,
+    )</code></pre>
+
+            <h3>步骤 4：重塑 K/V Cache 张量</h3>
+
+            <pre><code class="language-python">dtype = kv_cache_spec.dtype
+
+# 根据是否使用 MLA 确定 K/V Cache 形状
+if not self.model_config.use_mla:
+    # 非 MLA 模型：K/V Cache 形状相同
+    k_shape = kv_cache_shape[1:]
+    v_shape = k_shape
+else:
+    # MLA 模型：K Cache (NoPE) 和 V Cache (RoPE) 形状不同
+    mla_num_blocks, mla_block_size, num_kv_heads, _ = kv_cache_shape
+
+    # k_cache: nope_cache (kv_lora_rank)
+    k_shape = [
+        mla_num_blocks,
+        mla_block_size,
+        num_kv_heads,
+        self.model_config.hf_text_config.kv_lora_rank,
+    ]
+
+    # v_cache: rope_cache (qk_rope_head_dim)
+    v_shape = [
+        mla_num_blocks,
+        mla_block_size,
+        num_kv_heads,
+        self.model_config.hf_text_config.qk_rope_head_dim,
+    ]
+
+# 执行视图转换
+k_cache = raw_k_tensor.view(dtype).view(k_shape)
+v_cache = raw_v_tensor.view(dtype).view(v_shape)</code></pre>
+
+            <div class="ascend-specific">
+                <h4>MLA 的 NoPE/RoPE 分离</h4>
+                <p>在 DeepSeek MLA 机制中，KV Cache 被分为两个独立的部分：</p>
+                <ul>
+                    <li><strong>K Cache (NoPE)</strong>：存储无位置编码的潜在向量，维度为 <code>kv_lora_rank</code>（通常为 512）</li>
+                    <li><strong>V Cache (RoPE)</strong>：存储带旋转位置编码的查询/键向量，维度为 <code>qk_rope_head_dim</code>（通常为 64-128）</li>
+                </ul>
+                <p>这种设计使得 MLA 可以显著减少 KV Cache 的内存占用，同时保持模型质量。</p>
+            </div>
+
+            <h3>步骤 5：处理稀疏注意力（DSA）</h3>
+
+            <pre><code class="language-python">if self.use_sparse and raw_dsa_k_tensor is not None:
+    # 获取索引头维度（DeepSeek V3.2 特有的稀疏注意力机制）
+    index_head_dim = self._get_sparse_kv_cache_ratio()[-1]
+
+    # 构建 DSA K Cache 形状
+    dsa_k_cache_shape = (
+        num_blocks,
+        kv_cache_spec.block_size,
+        kv_cache_spec.num_kv_heads,
+        index_head_dim,
+    )
+
+    # 重塑 DSA K Cache
+    dsa_k_cache = raw_dsa_k_tensor.view(dtype).view(dsa_k_cache_shape)
+
+    # 返回三元组 (K, V, DSA_K)
+    kv_caches[layer_name] = (k_cache, v_cache, dsa_k_cache)
+else:
+    # 返回二元组 (K, V)
+    kv_caches[layer_name] = (k_cache, v_cache)</code></pre>
+
+            <h2>4.4 MambaSpec 处理流程</h2>
+
+            <p>对于 Mamba 等状态空间模型的线性注意力机制，KV Cache 的处理方式不同：</p>
+
+            <pre><code class="language-python">elif isinstance(kv_cache_spec, MambaSpec):
+    raw_tensor = kv_cache_raw_tensors[layer_name]
+    assert raw_tensor is not None
+    assert raw_tensor.numel() % kv_cache_spec.page_size_bytes == 0
+
+    num_blocks = raw_tensor.numel() // kv_cache_spec.page_size_bytes
+    assert num_blocks >= kv_cache_config.num_blocks
+
+    # Mamba 状态张量列表
+    state_tensors = []
+    target_idx = 0
+    start_idx = 0
+
+    # 遍历所有状态形状和数据类型
+    for shape, dtype in zip(kv_cache_spec.shapes, kv_cache_spec.dtypes):
+        # 正常情况下，这个循环包含 conv state 和 ssm state
+        # 某些特殊模型可能只有 conv state
+        target_shape = (num_blocks, *shape)
+
+        # 计算目标索引位置
+        target_idx += torch.prod(torch.tensor(target_shape)).item()
+
+        # 从原始张量中切片出当前状态张量
+        tensor = raw_tensor.view(dtype)[start_idx:target_idx].view(target_shape)
+        start_idx = target_idx
+
+        state_tensors.append(tensor)
+
+    # 返回状态张量列表
+    kv_caches[layer_name] = state_tensors</code></pre>
+
+            <div class="mermaid">
+flowchart LR
+    subgraph MambaSpec
+        A[raw_tensor] --> B[Parse shapes/dtypes]
+        B --> C{For each state}
+        C --> D[conv_state]
+        C --> E[ssm_state]
+        D --> F[slice by numel]
+        E --> F
+        F --> G[reshape to target_shape]
+        G --> H[state_tensors list]
+    end
+            </div>
+
+            <h2>4.5 完整调用流程图</h2>
+
+            <div class="diagram">┌─────────────────────────────────────────────────────────────────┐
+│              _reshape_kv_cache_tensors                           │
+└────────────────────────┬────────────────────────────────────────┘
+                         │
+          ┌──────────────┴──────────────┐
+          │                             │
+          ▼                             ▼
+┌───────────────────┐         ┌───────────────────┐
+│   AttentionSpec   │         │     MambaSpec     │
+│   (标准注意力)     │         │  (线性注意力)     │
+└─────────┬─────────┘         └─────────┬─────────┘
+          │                             │
+    ┌─────┴─────┐                       │
+    │           │                       │
+    ▼           ▼                       │
+┌───────┐  ┌────────┐                  │
+│  MLA  │  │  Non-  │                  │
+│ Yes  │  │  MLA   │                  │
+└───┬───┘  └───┬────┘                  │
+    │          │                       │
+    ▼          ▼                       │
+┌────────┐ ┌────────┐                 │
+│NoPE/   │ │ K/V    │                 │
+│RoPE    │ │ Same   │                 │
+│分离    │ │ Shape  │                 │
+└───┬────┘ └───┬────┘                 │
+    │          │                      │
+    │    ┌─────┴──────┐               │
+    │    │            │               │
+    │    ▼            ▼               │
+    │ ┌──────┐  ┌──────────┐         │
+    │ │Sparse│  │ Standard │         │
+    │ │Yes   │  │          │         │
+    │ └──┬───┘  └────┬─────┘         │
+    │    │           │               │
+    │    ▼           ▼               │
+    │ ┌───────┐ ┌─────────┐         │
+    │ │DSA_K  │ │ (K, V)  │         │
+    │ └───┬───┘ └────┬────┘         │
+    │    │           │               │
+    │    │           │               │
+    │    └─────┬─────┘               │
+    │          │                     │
+    │          ▼                     │
+    │    ┌─────────────┐             │
+    │    │ (K, V,      │             │
+    │    │  DSA_K)     │             │
+    │    └─────────────┘             │
+    │          │                     │
+    └──────────┼─────────────────────┘
+               │
+               ▼
+    ┌───────────────────────┐
+    │  kv_caches[layer] =   │
+    │  (k_cache, v_cache)   │
+    │  or                   │
+    │  [state_tensors]      │
+    └───────────────────────┘</div>
+
+            <h2>4.6 关键数据验证</h2>
+
+            <div class="highlight-box">
+                <h4>关键断言检查</h4>
+                <ul>
+                    <li><code>assert raw_k_tensor is not None</code> - K Cache 张量必须存在</li>
+                    <li><code>assert raw_v_tensor is not None</code> - V Cache 张量必须存在</li>
+                    <li><code>assert sum_page_size_bytes % kv_cache_spec.page_size_bytes == 0</code> - 总字节数必须是 page 大小的整数倍</li>
+                    <li><code>assert num_blocks >= kv_cache_config.num_blocks</code> - 可用块数不小于配置要求</li>
+                </ul>
+            </div>
+
+            <div class="chapter-nav">
+                <a href="03-kv-cache-alloc.html">
+                    <div style="text-align: left;">
+                        <div class="nav-label">Previous Chapter</div>
+                        <div class="nav-title">← KV Cache 张量分配</div>
+                    </div>
+                </a>
+                <a href="05-special-attn.html">
+                    <div style="text-align: right;">
+                        <div class="nav-label">Next Chapter</div>
+                        <div class="nav-title">特殊注意力机制支持 →</div>
+                    </div>
+                </a>
+            </div>
+        </main>
+    </div>
+
+    <script>
+        hljs.highlightAll();
+        mermaid.initialize({
+            startOnLoad: true,
+            theme: 'dark',
+            themeVariables: {
+                darkMode: true,
+                background: '#161b22',
+                primaryColor: '#58a6ff',
+                primaryTextColor: '#c9d1d9',
+                primaryBorderColor: '#30363d',
+                lineColor: '#8b949e',
+                secondaryColor: '#21262d',
+                tertiaryColor: '#161b22'
+            }
+        });
+    </script>
+</body>
+</html>

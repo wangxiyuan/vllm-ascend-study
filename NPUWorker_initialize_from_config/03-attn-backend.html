@@ -1,0 +1,333 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>03 - KV Cache 张量分配 - NPUWorker.initialize_from_config</title>
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/styles/github-dark.min.css">
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/highlight.min.js"></script>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/languages/python.min.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/mermaid@10/dist/mermaid.min.js"></script>
+    <link rel="stylesheet" href="../styles.css">
+</head>
+<body>
+    <div class="container">
+        <nav class="sidebar">
+            <a href="../index.html" class="back-to-home">← 返回主页</a>
+            <div class="sidebar-header">
+                <h1>NPUWorker::initialize_from_config</h1>
+                <p>KV Cache 初始化流程分析</p>
+            </div>
+            <div class="nav-section">
+                <div class="nav-section-title">文档目录</div>
+                <a href="index.html" class="nav-item"><span class="nav-item-number">00</span>概述</a>
+                <a href="01-entry-point.html" class="nav-item"><span class="nav-item-number">01</span>入口方法</a>
+                <a href="02-kv-cache-init.html" class="nav-item"><span class="nav-item-number">02</span>KV Cache 初始化</a>
+                <a href="03-attn-backend.html" class="nav-item active"><span class="nav-item-number">03</span>Attention Backend</a>
+                <a href="04-kv-cache-alloc.html" class="nav-item"><span class="nav-item-number">04</span>KV Cache 分配</a>
+                <a href="05-kv-cache-reshape.html" class="nav-item"><span class="nav-item-number">05</span>KV Cache 重塑</a>
+                <a href="06-special-attn.html" class="nav-item"><span class="nav-item-number">06</span>特殊注意力支持</a>
+                <a href="07-kv-bind.html" class="nav-item"><span class="nav-item-number">07</span>KV Cache 绑定</a>
+                <a href="08-summary.html" class="nav-item"><span class="nav-item-number">08</span>流程总结</a>
+            </div>
+        </nav>
+
+        <main class="main-content">
+            <h1>03 - KV Cache 张量分配</h1>
+
+            <div class="file-location">vllm_ascend/worker/model_runner_v1.py:2497</div>
+
+            <h2>3.1 _allocate_kv_cache_tensors 方法概览</h2>
+
+            <p><code>_allocate_kv_cache_tensors</code> 方法负责为 KV Cache 分配原始内存缓冲区。该方法不直接创建最终形状的张量，而是分配一个足够大的一维 int8 缓冲区，后续会通过 reshape 操作转换为所需的形状。</p>
+
+            <h3>方法签名</h3>
+
+            <pre><code class="language-python">def _allocate_kv_cache_tensors(
+    self,
+    kv_cache_config: KVCacheConfig
+) -> dict[str, torch.Tensor]:
+    """
+    Initializes the KV cache buffer with the correct size. The buffer needs
+    to be reshaped to the desired shape before being used by the models.
+
+    NOTE: To support prefill disaggregation, we need to split kvcache tensor into
+    k_cache and v cache, and the addr of both are aligned by 2M
+
+    Args:
+        kv_cache_config: The KV cache config
+    Returns:
+        dict[str, torch.Tensor]: A map between layer names to their
+        corresponding memory buffer for KV cache.
+    """</code></pre>
+
+            <div class="highlight-box">
+                <h4>为什么使用一维 int8 缓冲区？</h4>
+                <p>使用一维 int8 缓冲区的原因：</p>
+                <ul>
+                    <li><strong>精确控制内存</strong>：通过 int8 类型可以精确控制分配的字节数</li>
+                    <li><strong>2M 内存对齐</strong>：支持 Prefill Disaggregation 特性，需要 K/V Cache 地址对齐到 2MB 边界</li>
+                    <li><strong>灵活重塑</strong>：可以根据不同的 KV Cache 规范重塑为任意形状</li>
+                </ul>
+            </div>
+
+            <h2>3.2 完整源码分析</h2>
+
+            <pre><code class="language-python">def _allocate_kv_cache_tensors(self, kv_cache_config: KVCacheConfig) -> dict[str, torch.Tensor]:
+    # 1. 初始化 KV Cache 原始张量字典
+    kv_cache_raw_tensors: dict[str, torch.Tensor | torch.Tensor | None] = {}
+
+    # 2. 2M 内存对齐要求（用于 Prefill Disaggregation）
+    alignment = 2 * 1024 * 1024  # 2MB
+
+    # 3. 遍历所有 KV Cache 张量配置
+    for kv_cache_tensor in kv_cache_config.kv_cache_tensors:
+        # 遍历该张量共享该内存的所有层
+        for idx in range(len(kv_cache_tensor.shared_by)):
+            layer_name = kv_cache_tensor.shared_by[idx]</code></pre>
+
+            <h2>3.3 Linear Attention (Mamba) 处理</h2>
+
+            <p>对于 Mamba 等状态空间模型的线性注意力机制，代码有特殊的处理逻辑：</p>
+
+            <pre><code class="language-python">if "linear_attn" in layer_name and layer_name not in kv_cache_raw_tensors:
+    # for mamba linear attention
+    if self.vllm_config.kv_transfer_config is None:
+        # 无 KV Transfer 配置：直接分配
+        tensor = torch.zeros(kv_cache_tensor.size, dtype=torch.int8, device=self.device)
+    else:
+        # 有 KV Transfer 配置：需要 2M 对齐
+        cache_size_aligned = kv_cache_tensor.size + alignment
+        tensor = torch.zeros(cache_size_aligned, dtype=torch.int8, device=self.device)
+        tensor = self._align_memory(tensor, alignment)[: kv_cache_tensor.size]
+
+    # 在同一个组内的所有 linear_attn 层共享该张量
+    for layer_name_inner in kv_cache_tensor.shared_by:
+        if "linear_attn" in layer_name_inner:
+            kv_cache_raw_tensors[layer_name_inner] = tensor</code></pre>
+
+            <h3>_align_memory 方法</h3>
+
+            <pre><code class="language-python">def _align_memory(self, tensor: torch.Tensor, alignment: int) -> torch.Tensor:
+    """对齐张量地址到指定的 alignment 边界。"""
+    data_ptr = tensor.data_ptr()
+    aligned_addr = (data_ptr + alignment - 1) // alignment * alignment
+    offset = (aligned_addr - data_ptr) // tensor.element_size()
+    return tensor[int(offset) :]</code></pre>
+
+            <div class="mermaid">
+sequenceDiagram
+    participant Config as KVCacheConfig
+    participant Alloc as _allocate_kv_cache_tensors
+    participant Mamba as Linear Attention
+    participant Attn as Standard Attention
+    participant MLA as MLA Attention
+
+    Config->>Alloc: kv_cache_tensors[]
+    Alloc->>Alloc: alignment = 2MB
+
+    loop for each kv_cache_tensor
+        loop for each layer in shared_by
+            Alloc->>Mamba: "linear_attn" in name?
+            Mamba->>Mamba: allocate int8 buffer
+            Mamba->>Mamba: apply 2M alignment
+
+            Alloc->>Attn: "attn" in name?
+            Attn->>Attn: calculate split factors
+            Attn->>Attn: allocate k_tensor, v_tensor
+            Attn->>MLA: use_mla?
+            MLA->>MLA: split by nope/rope head_dim
+        end
+    end
+
+    Alloc->>Alloc: verify all layers initialized
+            </div>
+
+            <h2>3.4 标准 Attention 处理</h2>
+
+            <p>对于标准的自注意力机制（包括滑动窗口注意力），需要根据不同的模型类型计算 K/V Cache 的分割比例。</p>
+
+            <pre><code class="language-python">elif "attn" in layer_name and layer_name not in kv_cache_raw_tensors:
+    # NOTE: We need to init k cache tensor (nope cache tensor in mla) and
+    # v cache tensor (rope cache tensor in mla) separately to support
+    # prefill disaggregation, as it only support the 0-dim of kv_cache
+    # is `num_blocks`.
+    #
+    # For deepseek mla, we need to split cache tensor according to the
+    # nope head dim and rope head dim.
+
+    # 1. 计算 MLA 的总 head size
+    if self.model_config.use_mla:
+        head_size = (
+            self.model_config.hf_text_config.qk_rope_head_dim
+            + self.model_config.hf_text_config.kv_lora_rank
+        )
+
+    dsa_k_cache_factor = None
+    dsa_k_cache_size = None
+
+    # 2. 根据模型类型确定分割因子
+    if not self.model_config.use_mla:
+        # 非 MLA 模型：使用 FullAttentionSpec，K/V 平均分割
+        k_tensor_split_factor = 2
+        v_tensor_split_factor = 2
+
+    elif self.use_sparse:
+        # DeepSeek V3.2 稀疏注意力：根据比例分割
+        sparse_sum_head_size = sum(self._get_sparse_kv_cache_ratio())
+        k_tensor_split_factor, v_tensor_split_factor, dsa_k_cache_factor = [
+            sparse_sum_head_size / ratio
+            for ratio in self._get_sparse_kv_cache_ratio()
+        ]
+        dsa_k_cache_size = int(kv_cache_tensor.size // dsa_k_cache_factor)
+
+    else:
+        # 其他 DeepSeek 模型：使用 MLAAttentionSpec
+        k_tensor_split_factor = head_size / self.model_config.hf_text_config.kv_lora_rank
+        v_tensor_split_factor = head_size / self.model_config.hf_text_config.qk_rope_head_dim</code></pre>
+
+            <div class="ascend-specific">
+                <h4>DeepSeek MLA 支持</h4>
+                <p>DeepSeek 模型使用 MLA（Multi-Latent Attention）机制，将 KV Cache 分为两部分：</p>
+                <ul>
+                    <li><strong>NoPE Cache</strong>（无位置编码缓存）：对应 <code>kv_lora_rank</code></li>
+                    <li><strong>RoPE Cache</strong>（旋转位置编码缓存）：对应 <code>qk_rope_head_dim</code></li>
+                </ul>
+                <p>这种设计允许在保持模型质量的同时显著减少 KV Cache 的内存占用。</p>
+            </div>
+
+            <h2>3.5 K/V 张量分配</h2>
+
+            <pre><code class="language-python"># 3. 计算 K/V 张量大小
+k_tensor_size = int(kv_cache_tensor.size // k_tensor_split_factor)
+v_tensor_size = int(kv_cache_tensor.size // v_tensor_split_factor)
+
+# 4. 分配 K/V Cache 张量
+if self.vllm_config.kv_transfer_config is None:
+    # 无 KV Transfer：直接分配
+    k_tensor = torch.zeros(k_tensor_size, dtype=torch.int8, device=self.device)
+    v_tensor = torch.zeros(v_tensor_size, dtype=torch.int8, device=self.device)
+
+    # DeepSeek 稀疏注意力：分配 DSA K Cache
+    if dsa_k_cache_factor is not None:
+        dsa_k_cache_tensor = torch.zeros(
+            dsa_k_cache_size, dtype=torch.int8, device=self.device
+        )
+else:
+    # 有 KV Transfer：需要 2M 对齐
+    k_tensor = torch.zeros(k_tensor_size + alignment, dtype=torch.int8, device=self.device)
+    v_tensor = torch.zeros(v_tensor_size + alignment, dtype=torch.int8, device=self.device)
+    k_tensor = self._align_memory(k_tensor, alignment)[:k_tensor_size]
+    v_tensor = self._align_memory(v_tensor, alignment)[:v_tensor_size]
+
+    if dsa_k_cache_factor is not None and dsa_k_cache_size is not None:
+        dsa_k_cache_tensor = torch.zeros(
+            dsa_k_cache_size + alignment, dtype=torch.int8, device=self.device
+        )
+        dsa_k_cache_tensor = self._align_memory(
+            dsa_k_cache_tensor, alignment
+        )[:dsa_k_cache_size]
+
+# 5. 将张量分配给所有共享该内存的层
+for layer_name_inner in kv_cache_tensor.shared_by:
+    if "attn" in layer_name_inner and "linear_attn" not in layer_name_inner:
+        kv_cache_raw_tensors[layer_name_inner] = (
+            (k_tensor, v_tensor)
+            if not self.use_sparse
+            else (k_tensor, v_tensor, dsa_k_cache_tensor)
+        )</code></pre>
+
+            <h2>3.6 验证所有层已初始化</h2>
+
+            <pre><code class="language-python"># 6. 验证所有层都已正确初始化
+layer_names = set()
+for group in kv_cache_config.kv_cache_groups:
+    for layer_name in group.layer_names:
+        # 跳过仅用于 Runner 的注意力层
+        if layer_name in self.runner_only_attn_layers:
+            continue
+        layer_names.add(layer_name)
+
+# 断言检查：确保所有层都有对应的 KV Cache 张量
+assert layer_names == set(kv_cache_raw_tensors.keys()), (
+    "Some layers are not correctly initialized"
+)
+
+return kv_cache_raw_tensors</code></pre>
+
+            <h2>3.7 内存分配策略总结</h2>
+
+            <div class="diagram">┌────────────────────────────────────────────────────────────────┐
+│              _allocate_kv_cache_tensors                         │
+└─────────────────────────┬──────────────────────────────────────┘
+                          │
+          ┌───────────────┼───────────────┐
+          │               │               │
+          ▼               ▼               ▼
+   ┌─────────────┐ ┌─────────────┐ ┌─────────────┐
+   │  Linear     │ │  Standard   │ │     MLA     │
+   │  Attention  │ │  Attention  │ │  Attention  │
+   │  (Mamba)    │ │             │ │  (DeepSeek) │
+   └──────┬──────┘ └──────┬──────┘ └──────┬──────┘
+          │               │               │
+          ▼               ▼               ▼
+   ┌─────────────┐ ┌─────────────┐ ┌─────────────┐
+   │ 单张量分配  │ │ K/V 分离分配│ │ NoPE/Rope   │
+   │ 2M 对齐可选 │ │ 2M 对齐可选 │ │ 分离分配    │
+   └─────────────┘ └──────┬──────┘ └──────┬──────┘
+                          │               │
+                          │               │
+                          ▼               ▼
+                   ┌─────────────────────────────┐
+                   │   返回 kv_cache_raw_tensors  │
+                   │   dict[layer_name] = tensor │
+                   └─────────────────────────────┘</div>
+
+            <h2>3.8 Ascend 特定优化</h2>
+
+            <div class="ascend-specific">
+                <h4>Prefill Disaggregation 支持</h4>
+                <p>Prefill Disaggregation 是一种将 Prefill 阶段和解码阶段分离的技术，允许在不同的设备上执行这两个阶段。为了实现这一点，需要：</p>
+                <ol>
+                    <li><strong>K/V Cache 分离</strong>：K Cache 和 V Cache 必须是独立的张量</li>
+                    <li><strong>2M 内存对齐</strong>：确保 K/V Cache 的地址对齐到 2MB 边界，以便高效传输</li>
+                    <li><strong>统一的 num_blocks 维度</strong>：KV Cache 的第 0 维必须是 <code>num_blocks</code>，便于索引和管理</li>
+                </ol>
+            </div>
+
+            <div class="chapter-nav">
+                <a href="02-attn-backend.html">
+                    <div style="text-align: left;">
+                        <div class="nav-label">Previous Chapter</div>
+                        <div class="nav-title">← Attention Backend 初始化</div>
+                    </div>
+                </a>
+                <a href="04-kv-cache-reshape.html">
+                    <div style="text-align: right;">
+                        <div class="nav-label">Next Chapter</div>
+                        <div class="nav-title">KV Cache 张量重塑 →</div>
+                    </div>
+                </a>
+            </div>
+        </main>
+    </div>
+
+    <script>
+        hljs.highlightAll();
+        mermaid.initialize({
+            startOnLoad: true,
+            theme: 'dark',
+            themeVariables: {
+                darkMode: true,
+                background: '#161b22',
+                primaryColor: '#58a6ff',
+                primaryTextColor: '#c9d1d9',
+                primaryBorderColor: '#30363d',
+                lineColor: '#8b949e',
+                secondaryColor: '#21262d',
+                tertiaryColor: '#161b22'
+            }
+        });
+    </script>
+</body>
+</html>

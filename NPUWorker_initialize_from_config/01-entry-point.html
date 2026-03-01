@@ -1,0 +1,194 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>01 - 入口方法 - NPUWorker::initialize_from_config</title>
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/styles/github-dark.min.css">
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/highlight.min.js"></script>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/languages/python.min.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/mermaid@10/dist/mermaid.min.js"></script>
+    <link rel="stylesheet" href="../styles.css">
+</head>
+<body>
+    <div class="container">
+        <nav class="sidebar">
+            <a href="../index.html" class="back-to-home">← 返回主页</a>
+            <div class="sidebar-header">
+                <h1>NPUWorker::initialize_from_config</h1>
+                <p>KV Cache 初始化流程分析</p>
+            </div>
+            <div class="nav-section">
+                <div class="nav-section-title">文档目录</div>
+                <a href="index.html" class="nav-item"><span class="nav-item-number">00</span>概述</a>
+                <a href="01-entry-point.html" class="nav-item active"><span class="nav-item-number">01</span>入口方法</a>
+                <a href="02-kv-cache-init.html" class="nav-item"><span class="nav-item-number">02</span>KV Cache 初始化</a>
+                <a href="03-attn-backend.html" class="nav-item"><span class="nav-item-number">03</span>Attention Backend</a>
+                <a href="04-kv-cache-alloc.html" class="nav-item"><span class="nav-item-number">04</span>KV Cache 分配</a>
+                <a href="05-kv-cache-reshape.html" class="nav-item"><span class="nav-item-number">05</span>KV Cache 重塑</a>
+                <a href="06-special-attn.html" class="nav-item"><span class="nav-item-number">06</span>特殊注意力支持</a>
+                <a href="07-kv-bind.html" class="nav-item"><span class="nav-item-number">07</span>KV Cache 绑定</a>
+                <a href="08-summary.html" class="nav-item"><span class="nav-item-number">08</span>流程总结</a>
+            </div>
+        </nav>
+
+        <main class="main-content">
+            <h1>01 - 入口方法</h1>
+
+            <div class="file-location">vllm_ascend/worker/worker.py:502</div>
+
+            <h2>1.1 方法签名与职责</h2>
+
+            <p><code>initialize_from_config</code> 是 NPUWorker 的核心初始化方法，负责根据传入的 KV Cache 配置为 Ascend NPU 分配和管理 KV Cache 内存。该方法在 vLLM 引擎启动阶段被调用，确保模型推理时有足够的显存用于存储键值对缓存。</p>
+
+            <h3>方法签名</h3>
+
+            <pre><code class="language-python">def initialize_from_config(self, kv_cache_config: KVCacheConfig) -> None:
+    """Allocate NPU KV cache with the specified kv_cache_config."""</code></pre>
+
+            <div class="highlight-box">
+                <h4>关键职责</h4>
+                <ul>
+                    <li><strong>睡眠模式支持</strong>：通过 CaMemAllocator 管理专用内存池</li>
+                    <li><strong>委托调用</strong>：将实际初始化工作委托给 NPUModelRunner</li>
+                    <li><strong>上下文管理</strong>：根据配置决定是否使用睡眠模式内存池</li>
+                </ul>
+            </div>
+
+            <h2>1.2 完整源码</h2>
+
+            <pre><code class="language-python">def initialize_from_config(self, kv_cache_config: KVCacheConfig) -> None:
+    """Allocate NPU KV cache with the specified kv_cache_config."""
+    # 1. 睡眠模式支持：使用专用的内存池
+    if self.vllm_config.model_config.enable_sleep_mode:
+        allocator = CaMemAllocator.get_instance()
+        context = allocator.use_memory_pool(tag="kv_cache")
+    else:
+        from contextlib import nullcontext
+        context = nullcontext()  # type: ignore
+
+    # 2. 在内存池上下文中初始化 KV Cache
+    with context:
+        self.model_runner.initialize_kv_cache(kv_cache_config)</code></pre>
+
+            <h2>1.3 调用流程图</h2>
+
+            <div class="mermaid">
+sequenceDiagram
+    participant Engine as Engine Core
+    participant Worker as NPUWorker
+    participant Allocator as CaMemAllocator
+    participant Runner as NPUModelRunner
+
+    Engine->>Worker: initialize_from_config(kv_cache_config)
+
+    alt Sleep Mode Enabled
+        Worker->>Allocator: get_instance()
+        Worker->>Allocator: use_memory_pool(tag="kv_cache")
+        Allocator-->>Worker: context manager
+    else Normal Mode
+        Worker->>Worker: nullcontext()
+    end
+
+    Worker->>Worker: with context:
+    Worker->>Runner: initialize_kv_cache(kv_cache_config)
+
+    Note over Runner: 详细调用链见下一章
+            </div>
+
+            <h2>1.4 睡眠模式支持</h2>
+
+            <p>vLLM Ascend 实现了睡眠模式功能，允许在 RLHF 等场景下临时卸载模型权重以释放显存。<code>CaMemAllocator</code> 是 Ascend 特定的内存分配器，负责管理显存的分配和回收。</p>
+
+            <div class="ascend-specific">
+                <h4>Ascend 特定实现</h4>
+                <p><strong>CaMemAllocator</strong>（Camera Memory Allocator）是华为 Ascend NPU 的专用内存管理组件。它支持：</p>
+                <ul>
+                    <li><strong>标签化内存池</strong>：通过 <code>tag="kv_cache"</code> 或 <code>tag="weights"</code> 标记不同的内存区域</li>
+                    <li><strong>内存卸载</strong>：睡眠模式下将权重卸载到 CPU 内存</li>
+                    <li><strong>快速唤醒</strong>：唤醒时恢复权重到 NPU</li>
+                </ul>
+            </div>
+
+            <h2>1.5 方法内部调用链</h2>
+
+            <div class="diagram">┌─────────────────────────────────────────────────────────────┐
+│           NPUWorker.initialize_from_config                   │
+└─────────────────────┬───────────────────────────────────────┘
+                      │
+                      ▼
+         ┌────────────────────────┐
+         │   睡眠模式检查         │
+         │   enable_sleep_mode    │
+         └──────────┬─────────────┘
+                    │
+        ┌───────────┴───────────┐
+        │ Yes                   │ No
+        ▼                       ▼
+┌───────────────────┐   ┌───────────────────┐
+│ CaMemAllocator    │   │ nullcontext       │
+│ use_memory_pool   │   │ (空上下文)        │
+│ tag="kv_cache"    │   └─────────┬─────────┘
+└─────────┬─────────┘             │
+          │                       │
+          └───────────┬───────────┘
+                      │
+                      ▼
+         ┌────────────────────────┐
+         │ model_runner.          │
+         │ initialize_kv_cache()  │
+         └──────────┬─────────────┘
+                    │
+                    ▼
+         下一章详细分析
+            </div>
+
+            <h2>1.6 关键参数</h2>
+
+            <h3>KVCacheConfig</h3>
+
+            <pre><code class="language-python"># KVCacheConfig 核心字段
+@dataclass
+class KVCacheConfig:
+    num_blocks: int  # KV Cache 块数量
+    kv_cache_groups: list[KVCacheGroupSpec]  # KV Cache 组列表
+    kv_cache_tensors: list[KVCacheTensor]  # KV Cache 张量列表</code></pre>
+
+            <p>该配置由 vLLM 的内存分析阶段生成，决定了每个 NPU 上可以分配的 KV Cache 块数量。</p>
+
+            <div class="chapter-nav">
+                <a href="index.html">
+                    <div style="text-align: left;">
+                        <div class="nav-label">Previous Chapter</div>
+                        <div class="nav-title">← 概述</div>
+                    </div>
+                </a>
+                <a href="02-kv-cache-init.html">
+                    <div style="text-align: right;">
+                        <div class="nav-label">Next Chapter</div>
+                        <div class="nav-title">KV Cache 初始化 →</div>
+                    </div>
+                </a>
+            </div>
+        </main>
+    </div>
+
+    <script>
+        hljs.highlightAll();
+        mermaid.initialize({
+            startOnLoad: true,
+            theme: 'dark',
+            themeVariables: {
+                darkMode: true,
+                background: '#161b22',
+                primaryColor: '#58a6ff',
+                primaryTextColor: '#c9d1d9',
+                primaryBorderColor: '#30363d',
+                lineColor: '#8b949e',
+                secondaryColor: '#21262d',
+                tertiaryColor: '#161b22'
+            }
+        });
+    </script>
+</body>
+</html>

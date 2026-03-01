@@ -1,0 +1,194 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>NPUWorker::initialize_from_config - KV Cache 初始化流程</title>
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/styles/github-dark.min.css">
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/highlight.min.js"></script>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/languages/python.min.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/mermaid@10/dist/mermaid.min.js"></script>
+    <link rel="stylesheet" href="../styles.css">
+</head>
+<body>
+    <div class="container">
+        <nav class="sidebar">
+            <a href="../index.html" class="back-to-home">← 返回主页</a>
+            <div class="sidebar-header">
+                <h1>NPUWorker::initialize_from_config</h1>
+                <p>KV Cache 初始化流程分析</p>
+            </div>
+            <div class="nav-section">
+                <div class="nav-section-title">文档目录</div>
+                <a href="index.html" class="nav-item active"><span class="nav-item-number">00</span>概述</a>
+                <a href="01-entry-point.html" class="nav-item"><span class="nav-item-number">01</span>入口方法</a>
+                <a href="02-kv-cache-init.html" class="nav-item"><span class="nav-item-number">02</span>KV Cache 初始化</a>
+                <a href="03-attn-backend.html" class="nav-item"><span class="nav-item-number">03</span>Attention Backend</a>
+                <a href="04-kv-cache-alloc.html" class="nav-item"><span class="nav-item-number">04</span>KV Cache 分配</a>
+                <a href="05-kv-cache-reshape.html" class="nav-item"><span class="nav-item-number">05</span>KV Cache 重塑</a>
+                <a href="06-special-attn.html" class="nav-item"><span class="nav-item-number">06</span>特殊注意力支持</a>
+                <a href="07-kv-bind.html" class="nav-item"><span class="nav-item-number">07</span>KV Cache 绑定</a>
+                <a href="08-summary.html" class="nav-item"><span class="nav-item-number">08</span>流程总结</a>
+            </div>
+        </nav>
+
+        <main class="main-content">
+            <h1>NPUWorker::initialize_from_config - KV Cache 初始化流程</h1>
+
+            <h2>概述</h2>
+            <p>
+                本文档深入分析 vLLM Ascend 中 <code>initialize_from_config</code> 方法的完整调用链，
+                该方法用于根据 KV Cache 配置为 Ascend NPU 分配和管理 KV Cache 内存。
+                这是 vLLM 引擎启动阶段的核心环节，确保模型推理时有足够的显存用于存储键值对缓存。
+            </p>
+
+            <h2>方法功能</h2>
+            <p>
+                <code>initialize_from_config</code> 方法的核心职责是：
+            </p>
+            <ul>
+                <li><strong>睡眠模式支持</strong>：通过 CaMemAllocator 管理专用内存池</li>
+                <li><strong>Attention Backend 初始化</strong>：创建和管理所有 Attention 后端实例</li>
+                <li><strong>KV Cache 分配</strong>：为每层分配原始内存缓冲区</li>
+                <li><strong>KV Cache 重塑</strong>：将缓冲区转换为所需的形状和数据类型</li>
+                <li><strong>KV Cache 绑定</strong>：将 KV Cache 绑定到模型前后文</li>
+                <li><strong>KV Transfer 注册</strong>：如果启用，注册 KV Cache 到传输组</li>
+            </ul>
+
+            <h2>调用链概览</h2>
+
+            <div class="diagram">+------------------------+     +---------------------------+     +--------------------------+
+| NPUWorker              |     | NPUModelRunner            |     | Attention Backend        |
+| initialize_from_config | --> | initialize_kv_cache       | --> | initialize_attn_backend  |
++------------------------+     +---------------------------+     +--------------------------+
+         |                              |                                 |
+         | 睡眠模式检查                  | 配置处理                         | 创建 AttentionGroup
+         v                              v                                 v
++------------------------+     +---------------------------+     +--------------------------+
+| CaMemAllocator         |     | initialize_kv_cache_      |     | bind_kv_cache            |
+| use_memory_pool        |     | tensors                   |     | 绑定到前后文              |
++------------------------+     +---------------------------+     +--------------------------+</div>
+
+            <h2>架构图</h2>
+
+            <div class="mermaid">
+            graph TD
+                A[NPUWorker.initialize_from_config] --> B{Sleep Mode?}
+                B -->|Yes| C[CaMemAllocator.use_memory_pool]
+                B -->|No| D[nullcontext]
+                C --> E[context manager]
+                D --> E
+                E --> F[NPUModelRunner.initialize_kv_cache]
+                F --> G[deepcopy config]
+                G --> H[initialize_attn_backend]
+                H --> I[create AttentionGroup]
+                I --> J[initialize_kv_cache_tensors]
+                J --> K[_allocate_kv_cache_tensors]
+                K --> L[_reshape_kv_cache_tensors]
+                L --> M[bind_kv_cache]
+                M --> N{KV Transfer?}
+                N -->|Yes| O[register_kv_caches]
+                N -->|No| P[END]
+                O --> P
+            </div>
+
+            <h2>关键数据结构</h2>
+
+            <table>
+                <thead>
+                    <tr>
+                        <th>数据结构</th>
+                        <th>描述</th>
+                        <th>位置</th>
+                    </tr>
+                </thead>
+                <tbody>
+                    <tr>
+                        <td><code>KVCacheConfig</code></td>
+                        <td>KV Cache 配置，包含块数量和组信息</td>
+                        <td>vllm/v1/kv_cache_interface.py</td>
+                    </tr>
+                    <tr>
+                        <td><code>AttentionGroup</code></td>
+                        <td>Attention Backend 分组，用于统一管理</td>
+                        <td>vllm/v1/worker/utils.py</td>
+                    </tr>
+                    <tr>
+                        <td><code>AttentionSpec</code></td>
+                        <td>标准注意力 KV Cache 规范</td>
+                        <td>vllm/v1/kv_cache_interface.py</td>
+                    </tr>
+                    <tr>
+                        <td><code>MLASpec</code></td>
+                        <td>DeepSeek MLA KV Cache 规范</td>
+                        <td>vllm/v1/kv_cache_interface.py</td>
+                    </tr>
+                    <tr>
+                        <td><code>MambaSpec</code></td>
+                        <td>Mamba 状态空间模型 KV Cache 规范</td>
+                        <td>vllm/v1/kv_cache_interface.py</td>
+                    </tr>
+                </tbody>
+            </table>
+
+            <h2>Ascend 特定适配</h2>
+
+            <div class="ascend-specific">
+                <h4>vllm-ascend 核心适配点</h4>
+                <ul>
+                    <li><strong>CaMemAllocator</strong>：Ascend NPU 专用内存分配器，支持睡眠模式</li>
+                    <li><strong>2M 内存对齐</strong>：支持 Prefill Disaggregation 特性</li>
+                    <li><strong>MLA 支持</strong>：DeepSeek 模型的 NoPE/RoPE 分离</li>
+                    <li><strong>稀疏注意力</strong>：DeepSeek V3.2 的 DSA K Cache</li>
+                </ul>
+            </div>
+
+            <h2>文档结构</h2>
+            <p>本文档系列包含以下章节：</p>
+            <ol>
+                <li><strong>入口方法</strong>：分析 NPUWorker.initialize_from_config 的实现</li>
+                <li><strong>KV Cache 初始化</strong>：深入 NPUModelRunner.initialize_kv_cache 的核心逻辑</li>
+                <li><strong>Attention Backend</strong>：Attention 后端初始化和 AttentionGroup 创建</li>
+                <li><strong>KV Cache 分配</strong>：原始内存缓冲区分配策略</li>
+                <li><strong>KV Cache 重塑</strong>：将缓冲区转换为所需的形状和数据类型</li>
+                <li><strong>特殊注意力支持</strong>：MLA、稀疏注意力、Mamba 的处理</li>
+                <li><strong>KV Cache 绑定</strong>：bind_kv_cache 和 KV Transfer 注册</li>
+                <li><strong>流程总结</strong>：完整的调用链回顾与总结</li>
+            </ol>
+
+            <div class="highlight-box">
+                <h4>关键点</h4>
+                <p>
+                    <code>initialize_from_config</code> 方法是 vLLM Ascend 内存管理的核心环节，
+                    它决定了 KV Cache 的内存布局、分配策略和绑定方式。理解这个流程对于优化 vLLM 的内存使用至关重要。
+                </p>
+            </div>
+
+            <div class="chapter-nav">
+                <a href="01-entry-point.html" class="next-chapter">
+                    <span class="nav-label">下一章</span>
+                    <span class="nav-title">入口方法 →</span>
+                </a>
+            </div>
+        </main>
+    </div>
+
+    <script>
+        hljs.highlightAll();
+        mermaid.initialize({
+            startOnLoad: true,
+            theme: 'dark',
+            themeVariables: {
+                darkMode: true,
+                background: '#161b22',
+                primaryColor: '#58a6ff',
+                primaryTextColor: '#c9d1d9',
+                primaryBorderColor: '#30363d',
+                lineColor: '#8b949e',
+                secondaryColor: '#21262d',
+                tertiaryColor: '#161b22'
+            }
+        });
+    </script>
+</body>
+</html>

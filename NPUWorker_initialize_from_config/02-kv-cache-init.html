@@ -1,0 +1,399 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>02 - Attention Backend 初始化 - NPUWorker.initialize_from_config</title>
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/styles/github-dark.min.css">
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/highlight.min.js"></script>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/languages/python.min.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/mermaid@10/dist/mermaid.min.js"></script>
+    <link rel="stylesheet" href="../styles.css">
+</head>
+<body>
+    <div class="container">
+        <nav class="sidebar">
+            <a href="../index.html" class="back-to-home">← 返回主页</a>
+            <div class="sidebar-header">
+                <h1>NPUWorker::initialize_from_config</h1>
+                <p>KV Cache 初始化流程分析</p>
+            </div>
+            <div class="nav-section">
+                <div class="nav-section-title">文档目录</div>
+                <a href="index.html" class="nav-item"><span class="nav-item-number">00</span>概述</a>
+                <a href="01-entry-point.html" class="nav-item"><span class="nav-item-number">01</span>入口方法</a>
+                <a href="02-kv-cache-init.html" class="nav-item active"><span class="nav-item-number">02</span>KV Cache 初始化</a>
+                <a href="03-attn-backend.html" class="nav-item"><span class="nav-item-number">03</span>Attention Backend</a>
+                <a href="04-kv-cache-alloc.html" class="nav-item"><span class="nav-item-number">04</span>KV Cache 分配</a>
+                <a href="05-kv-cache-reshape.html" class="nav-item"><span class="nav-item-number">05</span>KV Cache 重塑</a>
+                <a href="06-special-attn.html" class="nav-item"><span class="nav-item-number">06</span>特殊注意力支持</a>
+                <a href="07-kv-bind.html" class="nav-item"><span class="nav-item-number">07</span>KV Cache 绑定</a>
+                <a href="08-summary.html" class="nav-item"><span class="nav-item-number">08</span>流程总结</a>
+            </div>
+        </nav>
+
+        <main class="main-content">
+            <h1>02 - Attention Backend 初始化</h1>
+
+            <div class="file-location">vllm_ascend/worker/model_runner_v1.py:2437</div>
+
+            <h2>2.1 initialize_kv_cache 方法概览</h2>
+
+            <p><code>initialize_kv_cache</code> 是 NPUModelRunner 的核心方法，负责完整的 KV Cache 初始化流程。该方法在 Worker 初始化阶段被调用，执行一系列有序的步骤来设置 Attention Backend 和分配 KV Cache 内存。</p>
+
+            <h3>方法签名</h3>
+
+            <pre><code class="language-python">def initialize_kv_cache(self, kv_cache_config: KVCacheConfig) -> None:
+    """
+    Initialize KV cache based on `kv_cache_config`.
+    Args:
+        kv_cache_config: Configuration for the KV cache, including the KV
+        cache size of each layer
+    """</code></pre>
+
+            <h2>2.2 完整调用流程</h2>
+
+            <div class="mermaid">
+flowchart TD
+    A[initialize_kv_cache] --> B[deepcopy kv_cache_config]
+    B --> C[may_add_encoder_only_layers]
+    C --> D[maybe_add_kv_sharing_layers]
+    D --> E[initialize_attn_backend]
+    E --> F[use_hybrid_blocks 设置]
+    F --> G[need_accepted_tokens 检测]
+    G --> H[may_reinitialize_input_batch]
+    H --> I[initialize_kv_cache_tensors]
+    I --> J{has_kv_transfer_group?}
+    J -->|Yes| K[register_kv_caches]
+    J -->|No| L{enable_return_routed_experts?}
+    K --> L
+    L -->|Yes| M[init_routed_experts_capturer]
+    L -->|No| N[End]
+    M --> N
+            </div>
+
+            <h2>2.3 完整源码分析</h2>
+
+            <pre><code class="language-python">def initialize_kv_cache(self, kv_cache_config: KVCacheConfig) -> None:
+    # 1. 深拷贝配置，避免修改原始配置对象
+    kv_cache_config = deepcopy(kv_cache_config)
+    self.kv_cache_config = kv_cache_config
+
+    # 2. 添加编码器专用层到 KV Cache 配置
+    self.may_add_encoder_only_layers_to_kv_cache_config()
+
+    # 3. 添加 KV 共享层到 KV Cache 组
+    self.maybe_add_kv_sharing_layers_to_kv_cache_groups(kv_cache_config)
+
+    # 4. 初始化 Attention Backend（必须在使用 attn_groups 之前）
+    # NOTE(cmq): initialize_attn_backend must before using self.attn_groups
+    self.initialize_attn_backend(kv_cache_config)
+
+    # 5. 设置混合块标志：当有多个 Attention 组时使用混合块
+    self.use_hybrid_blocks = len(self.attn_groups) > 1
+
+    # 6. 检测是否需要 num_accepted_tokens（通过 MambaSpec 判断）
+    # NOTE: Currently, we determine whether we need `num_accepted_tokens`
+    # through `MambaSpec`.
+    self.need_accepted_tokens = any(
+        [isinstance(attn_group[0].kv_cache_spec, MambaSpec)
+         for attn_group in self.attn_groups]
+    )
+
+    # 7. 重新初始化输入批次（如果 block sizes 不同）
+    self.may_reinitialize_input_batch(kv_cache_config)
+
+    # 8. 初始化 KV Cache 张量（核心分配逻辑）
+    kv_caches = self.initialize_kv_cache_tensors(kv_cache_config)
+
+    # 9. 注册 KV Cache 到 KV Transfer 组（如果启用）
+    if has_kv_transfer_group():
+        get_kv_transfer_group().register_kv_caches(kv_caches)
+
+    # 10. 初始化路由专家捕获器（如果启用）
+    if self.model_config.enable_return_routed_experts:
+        self.init_routed_experts_capturer()</code></pre>
+
+            <div class="highlight-box">
+                <h4>关键注释</h4>
+                <p><strong>NOTE(cmq)</strong>: <code>initialize_attn_backend</code> 必须在任何使用 <code>self.attn_groups</code> 的操作之前调用。这是因为 <code>attn_groups</code> 是在该方法中被初始化的，后续的所有操作都依赖于这个数据结构。</p>
+            </div>
+
+            <h2>2.4 initialize_attn_backend 详解</h2>
+
+            <p><code>initialize_attn_backend</code> 方法负责创建和管理所有 Attention Backend 实例。在 vLLM 中，不同的层可能使用不同的注意力实现，因此需要为每种类型创建相应的后端。</p>
+
+            <pre><code class="language-python">def initialize_attn_backend(self, kv_cache_config: KVCacheConfig) -> None:
+    """
+    Initialize the attention backends and attention metadata builders.
+    """
+    # 断言检查：确保 Attention Backend 尚未初始化
+    assert len(self.attn_groups) == 0, "Attention backends are already initialized"
+
+    # 定义 AttentionGroupKey 命名元组用于去重
+    class AttentionGroupKey(NamedTuple):
+        attn_backend: type[AttentionBackend]
+        kv_cache_spec: KVCacheSpec</code></pre>
+
+            <h3>AttentionGroupKey 数据结构</h3>
+
+            <p><code>AttentionGroupKey</code> 是一个局部定义的命名元组，用于对 Attention Backend 进行去重和分组。它将相同类型的 Backend 归为一组，以便统一管理和优化。</p>
+
+            <h2>2.5 get_attn_backends_for_group 函数</h2>
+
+            <p>这是一个内部辅助函数，用于从配置中提取所有唯一的 Attention Backend 类型。</p>
+
+            <pre><code class="language-python">def get_attn_backends_for_group(
+    kv_cache_group_spec: KVCacheGroupSpec,
+) -> tuple[dict[AttentionGroupKey, list[str]], set[type[AttentionBackend]]]:
+    # 从 vllm_config 中获取指定层名的 AttentionLayerBase 实例
+    layers = get_layers_from_vllm_config(
+        self.vllm_config,
+        AttentionLayerBase,
+        kv_cache_group_spec.layer_names
+    )
+
+    attn_backends = {}
+    attn_backend_layers = defaultdict(list)
+
+    # 遍历所有层，收集注意力后端
+    for layer_name in kv_cache_group_spec.layer_names:
+        # 从层实例获取其关联的注意力后端
+        attn_backend = layers[layer_name].get_attn_backend()
+
+        # 使用全类名作为键（支持动态创建的子类）
+        full_cls_name = attn_backend.full_cls_name()
+
+        # 处理 UniformTypeKVCacheSpecs 类型
+        layer_kv_cache_spec = kv_cache_group_spec.kv_cache_spec
+        if isinstance(layer_kv_cache_spec, UniformTypeKVCacheSpecs):
+            layer_kv_cache_spec = layer_kv_cache_spec.kv_cache_specs[layer_name]
+
+        # 创建唯一键
+        key = (full_cls_name, layer_kv_cache_spec)
+        attn_backends[key] = AttentionGroupKey(attn_backend, layer_kv_cache_spec)
+        attn_backend_layers[key].append(layer_name)
+
+    # 返回映射关系和后端类型集合
+    return (
+        {attn_backends[k]: v for k, v in attn_backend_layers.items()},
+        set(group_key.attn_backend for group_key in attn_backends.values())
+    )</code></pre>
+
+            <div class="mermaid">
+flowchart LR
+    subgraph Input
+        A[KVCacheGroupSpec]
+    end
+
+    subgraph Process
+        B[get_layers_from_vllm_config]
+        C[遍历 layer_names]
+        D[layer.get_attn_backend]
+        E[full_cls_name 去重]
+        F[UniformTypeKVCacheSpecs 处理]
+    end
+
+    subgraph Output
+        G[attn_backends_map]
+        H[backend_set]
+    end
+
+    A --> B --> C --> D --> E --> F --> G
+    E --> H
+            </div>
+
+            <h2>2.6 create_attn_groups 函数</h2>
+
+            <p>根据获取的后端映射关系创建 AttentionGroup 实例。</p>
+
+            <pre><code class="language-python">def create_attn_groups(
+    attn_backends_map: dict[AttentionBackend, list[str]],
+    kv_cache_group_id: int
+) -> list[AttentionGroup]:
+    attn_groups: list[AttentionGroup] = []
+
+    for (attn_backend, kv_cache_spec), layer_names in attn_backends_map.items():
+        # 为每组创建 AttentionMetadataBuilder
+        attn_metadata_builders = []
+        attn_metadata_builders.append(
+            attn_backend.get_builder_cls()(
+                kv_cache_spec,
+                layer_names,
+                self.vllm_config,
+                self.device,
+            )
+        )
+
+        # 创建 AttentionGroup
+        attn_group = AttentionGroup(
+            attn_backend,
+            layer_names,
+            kv_cache_spec,
+            kv_cache_group_id,
+            attn_metadata_builders
+        )
+        attn_groups.append(attn_group)
+
+    return attn_groups</code></pre>
+
+            <h2>2.7 AttentionGroup 数据结构</h2>
+
+            <div class="file-location">vllm/vllm/v1/worker/utils.py:35</div>
+
+            <pre><code class="language-python">@dataclass
+class AttentionGroup:
+    """Attention 后端分组，用于统一管理相同类型的注意力层。"""
+
+    backend: type[AttentionBackend]  # Attention 后端类型
+    layer_names: list[str]  # 该组管理的层名称列表
+    kv_cache_spec: KVCacheSpec  # KV Cache 规范
+    kv_cache_group_id: int  # KV Cache 组 ID
+    metadata_builders: list[AttentionMetadataBuilder] = field(
+        default_factory=lambda: []
+    )  # 元数据构建器列表（用于 ubatching）
+
+    def create_metadata_builders(
+        self,
+        vllm_config,
+        device,
+        kernel_block_size: int | None,
+        num_metadata_builders: int = 1,
+    ):
+        """为每个 ubatch 创建元数据构建器。"""
+        ...
+
+    def get_metadata_builder(self, ubatch_id: int = 0) -> AttentionMetadataBuilder:
+        """获取指定 ubatch 的元数据构建器。"""
+        ...</code></pre>
+
+            <div class="highlight-box">
+                <h4>为什么需要 AttentionGroup？</h4>
+                <p>在 vLLM 中，不同的模型层可能使用不同的注意力机制实现：</p>
+                <ul>
+                    <li><strong>标准 Attention</strong>：用于大多数 Transformer 层</li>
+                    <li><strong>MLA（Multi-Latent Attention）</strong>：用于 DeepSeek 等模型</li>
+                    <li><strong>Sliding Window Attention</strong>：用于局部注意力场景</li>
+                    <li><strong>Linear Attention</strong>：用于 Mamba 等状态空间模型</li>
+                </ul>
+                <p><code>AttentionGroup</code> 将相同类型的层分组，便于统一管理和优化。</p>
+            </div>
+
+            <h2>2.8 主流程执行</h2>
+
+            <pre><code class="language-python"># 收集所有注意力后端类型（用于 cudagraph 模式检查）
+attention_backend_maps = []
+attention_backend_list = []
+
+for kv_cache_group_spec in kv_cache_config.kv_cache_groups:
+    attn_backends = get_attn_backends_for_group(kv_cache_group_spec)
+    attention_backend_maps.append(attn_backends[0])
+    attention_backend_list.append(attn_backends[1])
+
+# 检查和更新 cudagraph 模式（确保所有后端兼容）
+self._check_and_update_cudagraph_mode(
+    attention_backend_list,
+    kv_cache_config.kv_cache_groups
+)
+
+# 为每个 KV Cache 组创建 AttentionGroup
+for i, kv_cache_group_spec in enumerate(kv_cache_config.kv_cache_groups):
+    attn_backends = get_attn_backends_for_group(kv_cache_group_spec)
+    self.attn_groups.append(create_attn_groups(attn_backends[0], i))
+
+# 计算重排序批次阈值（如果后端需要）
+self.calculate_reorder_batch_threshold()</code></pre>
+
+            <h2>2.9 calculate_reorder_batch_threshold</h2>
+
+            <p>该方法检查所有 Attention Backend 是否需要批次重排序，并确保所有后端的阈值设置一致。</p>
+
+            <pre><code class="language-python">def calculate_reorder_batch_threshold(self) -> None:
+    """
+    Check that if any backends reorder batches; that the reordering
+    is compatible (e.g., decode threshold is the same)
+    """
+    for group in self._attn_group_iterator():
+        attn_metadata_builder_i = group.get_metadata_builder()
+
+        if hasattr(attn_metadata_builder_i, "reorder_batch_threshold"):
+            reorder_batch_threshold_i = attn_metadata_builder_i.reorder_batch_threshold
+
+            if reorder_batch_threshold_i is not None:
+                if self.reorder_batch_threshold is not None:
+                    # 检查阈值是否一致
+                    if reorder_batch_threshold_i != self.reorder_batch_threshold:
+                        raise ValueError(
+                            f"Attention backend reorders decodes with threshold "
+                            f"{reorder_batch_threshold_i} but other backend uses "
+                            f"threshold {self.reorder_batch_threshold}"
+                        )
+                else:
+                    self.reorder_batch_threshold = reorder_batch_threshold_i</code></pre>
+
+            <h2>2.10 调用链总结</h2>
+
+            <div class="diagram">┌───────────────────────────────────────────────────────────────┐
+│          initialize_kv_cache (完整流程)                        │
+└──────────────────────┬────────────────────────────────────────┘
+                       │
+        ┌──────────────┼──────────────┐
+        │              │              │
+        ▼              ▼              ▼
+┌──────────────┐ ┌──────────────┐ ┌─────────────────┐
+│ 配置处理     │ │ Attn Backend │ │ KV Cache 分配   │
+│ - deepcopy   │ │ 初始化       │ │ - allocate      │
+│ - encoder    │ │ - get_backends│ │ - reshape       │
+│ - sharing    │ │ - create_grps │ │ - bind          │
+└──────────────┘ └──────────────┘ └─────────────────┘
+                       │
+                       ▼
+         ┌─────────────────────────┐
+         │   initialize_attn       │
+         │   _backend              │
+         │                         │
+         │  ┌───────────────────┐  │
+         │  │ for each group:   │  │
+         │  │  - get_backends   │  │
+         │  │  - create_groups  │  │
+         │  │  - check_cudagraph│  │
+         │  │  - calc_threshold │  │
+         │  └───────────────────┘  │
+         └─────────────────────────┘</div>
+
+            <div class="chapter-nav">
+                <a href="01-overview.html">
+                    <div style="text-align: left;">
+                        <div class="nav-label">Previous Chapter</div>
+                        <div class="nav-title">← 入口方法概览</div>
+                    </div>
+                </a>
+                <a href="03-kv-cache-alloc.html">
+                    <div style="text-align: right;">
+                        <div class="nav-label">Next Chapter</div>
+                        <div class="nav-title">KV Cache 张量分配 →</div>
+                    </div>
+                </a>
+            </div>
+        </main>
+    </div>
+
+    <script>
+        hljs.highlightAll();
+        mermaid.initialize({
+            startOnLoad: true,
+            theme: 'dark',
+            themeVariables: {
+                darkMode: true,
+                background: '#161b22',
+                primaryColor: '#58a6ff',
+                primaryTextColor: '#c9d1d9',
+                primaryBorderColor: '#30363d',
+                lineColor: '#8b949e',
+                secondaryColor: '#21262d',
+                tertiaryColor: '#161b22'
+            }
+        });
+    </script>
+</body>
+</html>
