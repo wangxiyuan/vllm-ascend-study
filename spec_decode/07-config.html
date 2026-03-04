@@ -1,0 +1,253 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>配置参数 - Speculative Decoding</title>
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/styles/github-dark.min.css">
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/highlight.min.js"></script>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/languages/python.min.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/mermaid@10/dist/mermaid.min.js"></script>
+    <link rel="stylesheet" href="../styles.css">
+</head>
+<body>
+    <div class="container">
+        <nav class="sidebar">
+            <a href="../index.html" class="back-to-home">← 返回主页</a>
+            <div class="sidebar-header">
+                <h1>Speculative Decoding</h1>
+                <p>推测解码技术详解</p>
+            </div>
+            <div class="nav-section">
+                <div class="nav-section-title">文档目录</div>
+                <a href="index.html" class="nav-item"><span class="nav-item-number">00</span>概述</a>
+                <a href="01-architecture.html" class="nav-item"><span class="nav-item-number">01</span>架构设计</a>
+                <a href="02-methods.html" class="nav-item"><span class="nav-item-number">02</span>支持的方法</a>
+                <a href="03-token-flow.html" class="nav-item"><span class="nav-item-number">03</span>Token 生成与传递</a>
+                <a href="04-scheduler.html" class="nav-item"><span class="nav-item-number">04</span>Scheduler 调度</a>
+                <a href="05-rejection-sample.html" class="nav-item"><span class="nav-item-number">05</span>拒绝采样</a>
+                <a href="06-draft-propose.html" class="nav-item"><span class="nav-item-number">06</span>Draft Token 生成</a>
+                <a href="07-config.html" class="nav-item active"><span class="nav-item-number">07</span>配置参数</a>
+                <a href="08-summary.html" class="nav-item"><span class="nav-item-number">08</span>流程总结</a>
+            </div>
+        </nav>
+
+        <main class="main-content">
+            <h1>配置参数</h1>
+
+            <h2>SpeculativeConfig</h2>
+            <p><strong>位置</strong>: <code>vllm/config/speculative.py</code></p>
+
+            <h3>核心配置项</h3>
+            <div class="code-block">
+                <pre><code class="language-python">@config
+class SpeculativeConfig:
+    # 基本控制
+    num_speculative_tokens: int  # 推测 token 数量
+    method: SpeculativeMethod   # 方法类型
+    model: str | None           # draft 模型路径
+
+    # Ngram 配置
+    prompt_lookup_min: int  # n-gram 最小长度
+    prompt_lookup_max: int  # n-gram 最大长度
+
+    # Suffix Decoding 配置
+    suffix_decoding_max_tree_depth: int
+    suffix_decoding_max_cached_requests: int
+    suffix_decoding_max_spec_factor: float
+    suffix_decoding_min_token_prob: float
+
+    # 高级控制
+    parallel_drafting: bool          # 并行草稿
+    disable_padded_drafter_batch: bool
+    use_local_argmax_reduction: bool</code></pre>
+            </div>
+
+            <h2>基本配置示例</h2>
+            <div class="code-block">
+                <pre><code class="language-python">speculative_config = {
+    # 必须参数
+    "method": "eagle",                    # 方法类型
+    "num_speculative_tokens": 4,          # 推测 token 数量
+
+    # 方法相关参数
+    "model": "yuhuili/EAGLE-LLaMA3-8B",   # draft 模型路径 (某些方法需要)
+    "prompt_lookup_max": 5,               # ngram 最大长度
+    "prompt_lookup_min": 2,               # ngram 最小长度
+
+    # 高级选项
+    "parallel_drafting": False,           # 并行草稿
+    "enforce_eager": False,               # 禁用 CUDA Graph
+    "draft_tensor_parallel_size": 1,      # draft 模型 TP 大小
+}</code></pre>
+            </div>
+
+            <h2>Suffix Decoding 配置</h2>
+            <div class="code-block">
+                <pre><code class="language-python">suffix_config = {
+    "method": "suffix",
+    "num_speculative_tokens": 24,
+    "suffix_decoding_max_tree_depth": 24,      # 树最大深度
+    "suffix_decoding_max_cached_requests": 10000,  # 最大缓存请求
+    "suffix_decoding_max_spec_factor": 1.0,    # 最大 spec 因子
+    "suffix_decoding_min_token_prob": 0.1,     # 最小 token 概率
+}</code></pre>
+            </div>
+
+            <h2>性能调优建议</h2>
+            <table>
+                <thead>
+                    <tr>
+                        <th>参数</th>
+                        <th>影响</th>
+                        <th>推荐值</th>
+                    </tr>
+                </thead>
+                <tbody>
+                    <tr>
+                        <td><code>num_speculative_tokens</code></td>
+                        <td>越大加速越多，但接受率下降</td>
+                        <td>2-5 (EAGLE), 4-8 (MTP)</td>
+                    </tr>
+                    <tr>
+                        <td><code>prompt_lookup_max</code></td>
+                        <td>影响 ngram 匹配质量</td>
+                        <td>5-10</td>
+                    </tr>
+                    <tr>
+                        <td><code>draft_tensor_parallel_size</code></td>
+                        <td>draft 模型并行度</td>
+                        <td>1 或与 target 相同</td>
+                    </tr>
+                    <tr>
+                        <td><code>suffix_decoding_max_tree_depth</code></td>
+                        <td>后缀树深度，影响匹配长度</td>
+                        <td>16-32</td>
+                    </tr>
+                </tbody>
+            </table>
+
+            <h2>使用示例</h2>
+
+            <h3>命令行使用</h3>
+            <div class="code-block">
+                <pre><code class="language-bash"># EAGLE 方法
+python examples/offline_inference/spec_decode.py \
+    --method eagle \
+    --num-spec-tokens 3 \
+    --model-dir meta-llama/Llama-3.1-8B-Instruct \
+    --eagle-dir yuhuili/EAGLE-LLaMA3.1-Instruct-8B
+
+# Ngram 方法
+python examples/offline_inference/spec_decode.py \
+    --method ngram \
+    --num-spec-tokens 4 \
+    --prompt-lookup-max 5 \
+    --prompt-lookup-min 2
+
+# MTP 方法 (DeepSeek)
+python examples/offline_inference/spec_decode.py \
+    --method mtp \
+    --num-spec-tokens 4 \
+    --model-dir deepseek-ai/DeepSeek-V3</code></pre>
+            </div>
+
+            <h3>Python API 使用</h3>
+            <div class="code-block">
+                <pre><code class="language-python">from vllm import LLM, SamplingParams
+
+# 配置 speculative decoding
+llm = LLM(
+    model="meta-llama/Llama-3.1-8B-Instruct",
+    speculative_config={
+        "method": "eagle",
+        "model": "yuhuili/EAGLE-LLaMA3.1-Instruct-8B",
+        "num_speculative_tokens": 3,
+    },
+)
+
+sampling_params = SamplingParams(
+    temperature=0.7,
+    max_tokens=256,
+)
+
+prompts = ["Hello, my name is"]
+outputs = llm.generate(prompts, sampling_params)
+
+for output in outputs:
+    print(output.outputs[0].text)</code></pre>
+            </div>
+
+            <h2>获取 Spec Decode 指标</h2>
+            <div class="code-block">
+                <pre><code class="language-python">from vllm.v1.metrics.reader import Counter, Vector
+
+metrics = llm.get_metrics()
+
+num_drafts = 0
+num_draft_tokens = 0
+num_accepted_tokens = 0
+
+for metric in metrics:
+    if metric.name == "vllm:spec_decode_num_drafts":
+        num_drafts = metric.value
+    elif metric.name == "vllm:spec_decode_num_draft_tokens":
+        num_draft_tokens = metric.value
+    elif metric.name == "vllm:spec_decode_num_accepted_tokens":
+        num_accepted_tokens = metric.value
+
+# 计算接受率
+acceptance_rate = num_accepted_tokens / num_draft_tokens * 100
+mean_acceptance_length = 1 + (num_accepted_tokens / num_drafts)
+
+print(f"Acceptance Rate: {acceptance_rate:.1f}%")
+print(f"Mean Acceptance Length: {mean_acceptance_length:.2f}")</code></pre>
+            </div>
+
+            <h2>Prometheus 指标</h2>
+            <div class="code-block">
+                <pre><code class="language-promql"># Speculative decoding 核心指标
+vllm:spec_decode_num_drafts              # 草稿迭代次数
+vllm:spec_decode_num_draft_tokens        # 草稿 token 总数
+vllm:spec_decode_num_accepted_tokens     # 接受 token 总数
+vllm:spec_decode_num_accepted_tokens_per_pos  # 每个位置的接受 token 数
+
+# 计算接受率
+rate(vllm:spec_decode_num_accepted_tokens[$interval]) /
+rate(vllm:spec_decode_num_draft_tokens[$interval])
+
+# 计算平均接受长度
+1 + (
+rate(vllm:spec_decode_num_accepted_tokens[$interval]) /
+rate(vllm:spec_decode_num_drafts[$interval]))</code></pre>
+            </div>
+
+            <div class="chapter-nav">
+                <a href="06-draft-propose.html" class="prev-chapter">← 上一章</a>
+                <a href="08-summary.html" class="next-chapter">
+                    <span class="nav-label">下一章</span>
+                    <span class="nav-title">流程总结 →</span>
+                </a>
+            </div>
+        </main>
+    </div>
+
+    <script>
+        hljs.highlightAll();
+        mermaid.initialize({
+            startOnLoad: true,
+            theme: 'dark',
+            themeVariables: {
+                darkMode: true,
+                background: '#161b22',
+                primaryColor: '#58a6ff',
+                primaryTextColor: '#c9d1d9',
+                primaryBorderColor: '#30363d',
+                lineColor: '#8b949e',
+                secondaryColor: '#21262d',
+                tertiaryColor: '#161b22'
+            }
+        });
+    </script>
+</body>
+</html>

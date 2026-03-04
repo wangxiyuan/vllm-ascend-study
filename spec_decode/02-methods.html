@@ -1,0 +1,259 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>支持的方法 - Speculative Decoding</title>
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/styles/github-dark.min.css">
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/highlight.min.js"></script>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/languages/python.min.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/mermaid@10/dist/mermaid.min.js"></script>
+    <link rel="stylesheet" href="../styles.css">
+</head>
+<body>
+    <div class="container">
+        <nav class="sidebar">
+            <a href="../index.html" class="back-to-home">← 返回主页</a>
+            <div class="sidebar-header">
+                <h1>Speculative Decoding</h1>
+                <p>推测解码技术详解</p>
+            </div>
+            <div class="nav-section">
+                <div class="nav-section-title">文档目录</div>
+                <a href="index.html" class="nav-item"><span class="nav-item-number">00</span>概述</a>
+                <a href="01-architecture.html" class="nav-item"><span class="nav-item-number">01</span>架构设计</a>
+                <a href="02-methods.html" class="nav-item active"><span class="nav-item-number">02</span>支持的方法</a>
+                <a href="03-token-flow.html" class="nav-item"><span class="nav-item-number">03</span>Token 生成与传递</a>
+                <a href="04-scheduler.html" class="nav-item"><span class="nav-item-number">04</span>Scheduler 调度</a>
+                <a href="05-rejection-sample.html" class="nav-item"><span class="nav-item-number">05</span>拒绝采样</a>
+                <a href="06-draft-propose.html" class="nav-item"><span class="nav-item-number">06</span>Draft Token 生成</a>
+                <a href="07-config.html" class="nav-item"><span class="nav-item-number">07</span>配置参数</a>
+                <a href="08-summary.html" class="nav-item"><span class="nav-item-number">08</span>流程总结</a>
+            </div>
+        </nav>
+
+        <main class="main-content">
+            <h1>支持的 Speculative 方法</h1>
+
+            <h2>方法对比</h2>
+            <table>
+                <thead>
+                    <tr>
+                        <th>方法</th>
+                        <th>是否需要额外模型</th>
+                        <th>优点</th>
+                        <th>缺点</th>
+                    </tr>
+                </thead>
+                <tbody>
+                    <tr>
+                        <td><strong>EAGLE</strong></td>
+                        <td>是 (EAGLE head)</td>
+                        <td>高接受率，速度快</td>
+                        <td>需要训练额外 head</td>
+                    </tr>
+                    <tr>
+                        <td><strong>EAGLE3</strong></td>
+                        <td>是 (EAGLE3 head)</td>
+                        <td>改进的 EAGLE，更高接受率</td>
+                        <td>需要特定模型支持</td>
+                    </tr>
+                    <tr>
+                        <td><strong>MTP</strong></td>
+                        <td>否 (内置)</td>
+                        <td>无需额外模型，集成度高</td>
+                        <td>仅支持特定架构</td>
+                    </tr>
+                    <tr>
+                        <td><strong>Ngram</strong></td>
+                        <td>否</td>
+                        <td>无需模型，简单快速</td>
+                        <td>接受率较低</td>
+                    </tr>
+                    <tr>
+                        <td><strong>Suffix Decoding</strong></td>
+                        <td>否</td>
+                        <td>利用历史缓存，无训练</td>
+                        <td>需要额外依赖</td>
+                    </tr>
+                    <tr>
+                        <td><strong>Draft Model</strong></td>
+                        <td>是 (完整模型)</td>
+                        <td>灵活，可自定义</td>
+                        <td>资源开销大</td>
+                    </tr>
+                    <tr>
+                        <td><strong>Medusa</strong></td>
+                        <td>是 (Medusa head)</td>
+                        <td>多 head 并行</td>
+                        <td>需要训练</td>
+                    </tr>
+                    <tr>
+                        <td><strong>MLPSpeculator</strong></td>
+                        <td>是 (MLP head)</td>
+                        <td>轻量级</td>
+                        <td>需要训练</td>
+                    </tr>
+                </tbody>
+            </table>
+
+            <h2>EAGLE / EAGLE3</h2>
+            <p><strong>位置</strong>: <code>vllm/v1/spec_decode/eagle.py</code>, <code>vllm_ascend/spec_decode/eagle_proposer.py</code></p>
+
+            <h3>原理</h3>
+            <ul>
+                <li>EAGLE 使用一个额外的 head 预测下一个 token 的特征</li>
+                <li>利用目标模型的隐藏状态进行快速预测</li>
+                <li>EAGLE3 是改进版本，支持更多模型架构</li>
+            </ul>
+
+            <h3>支持的目标模型</h3>
+            <div class="code-block">
+                <pre><code class="language-python">eagle3_target_supported = [
+    "llama", "qwen", "minicpm", "gpt_oss",
+    "hunyuan_vl", "hunyuan_v1_dense",
+    "afmoe", "nemotron_h"
+]</code></pre>
+            </div>
+
+            <h3>核心代码结构</h3>
+            <div class="code-block">
+                <pre><code class="language-python">class SpecDecodeBaseProposer:
+    """Speculative decoding 的基础类"""
+
+    def __init__(self, vllm_config, device, ...):
+        self.speculative_config = vllm_config.speculative_config
+        self.num_speculative_tokens = spec_cfg.num_speculative_tokens
+        # ...初始化 buffers 和配置
+
+    def propose(self, target_hidden_states, sampling_metadata):
+        """生成草稿 token"""
+        # 1. 准备输入
+        # 2. 调用 draft model
+        # 3. 返回 draft tokens</code></pre>
+            </div>
+
+            <h2>MTP (Multi-Token Prediction)</h2>
+            <p><strong>位置</strong>: <code>vllm/config/speculative.py</code></p>
+
+            <h3>原理</h3>
+            <ul>
+                <li>MTP 是模型内置的多 token 预测层</li>
+                <li>某些模型架构（如 DeepSeek、Qwen3.5、Pangu 等）原生支持</li>
+                <li>无需额外的 draft 模型</li>
+            </ul>
+
+            <h3>配置转换</h3>
+            <div class="code-block">
+                <pre><code class="language-python">def hf_config_override(hf_config):
+    """自动检测并配置 MTP"""
+    if hf_config.model_type in ("deepseek_v3", "deepseek_v32"):
+        hf_config.model_type = "deepseek_mtp"
+    if hf_config.model_type == "qwen3_5_moe":
+        hf_config.model_type = "qwen3_5_mtp"
+    # ...更多 MTP 类型
+    return hf_config</code></pre>
+            </div>
+
+            <h2>Ngram Proposer</h2>
+            <p><strong>位置</strong>: <code>vllm/v1/spec_decode/ngram_proposer.py</code></p>
+
+            <h3>原理</h3>
+            <ul>
+                <li>基于 n-gram 匹配的轻量级方法</li>
+                <li>在上下文中查找匹配的 n-gram，提取后续 token 作为草稿</li>
+                <li>无需额外模型，纯 CPU 计算</li>
+            </ul>
+
+            <h3>核心算法</h3>
+            <div class="code-block">
+                <pre><code class="language-python">def _find_longest_matched_ngram_and_propose_tokens(
+    origin_tokens, min_ngram, max_ngram, max_model_len, k
+):
+    """
+    使用 KMP 算法的 LPS (Longest Prefix Suffix) 数组
+    找到与后缀匹配的最长 n-gram
+    """
+    # 1. 反转 token 序列
+    # 2. 构建 LPS 数组
+    # 3. 找到最长匹配
+    # 4. 返回匹配的后续 k 个 token</code></pre>
+            </div>
+
+            <h3>配置参数</h3>
+            <ul>
+                <li><code>prompt_lookup_min</code>: n-gram 最小长度（默认 5）</li>
+                <li><code>prompt_lookup_max</code>: n-gram 最大长度（默认 5）</li>
+            </ul>
+
+            <h2>Suffix Decoding</h2>
+            <p><strong>位置</strong>: <code>vllm/v1/spec_decode/suffix_decoding.py</code></p>
+
+            <h3>原理</h3>
+            <ul>
+                <li>基于 Arctic Inference 的实现</li>
+                <li>维护全局缓存和 per-prompt 后缀树</li>
+                <li>动态决定 speculative 长度</li>
+            </ul>
+
+            <h3>核心类</h3>
+            <div class="code-block">
+                <pre><code class="language-python">class SuffixDecodingProposer:
+    def __init__(self, vllm_config):
+        self.suffix_cache = SuffixDecodingCache(
+            max_tree_depth=config.suffix_decoding_max_tree_depth,
+            max_cached_requests=config.suffix_decoding_max_cached_requests,
+        )
+
+    def propose(self, input_batch, sampled_token_ids):
+        # 1. 更新缓存
+        # 2. 匹配后缀
+        # 3. 返回草稿 token</code></pre>
+            </div>
+
+            <h2>Draft Model</h2>
+
+            <h3>原理</h3>
+            <ul>
+                <li>使用一个独立的较小模型作为 draft 模型</li>
+                <li>最灵活但资源开销最大</li>
+            </ul>
+
+            <h3>配置示例</h3>
+            <div class="code-block">
+                <pre><code class="language-python">speculative_config = {
+    "method": "draft_model",
+    "model": "TinyLlama/TinyLlama-1.1B-Chat-v1.0",
+    "num_speculative_tokens": 4,
+}</code></pre>
+            </div>
+
+            <div class="chapter-nav">
+                <a href="01-architecture.html" class="prev-chapter">← 上一章</a>
+                <a href="03-token-flow.html" class="next-chapter">
+                    <span class="nav-label">下一章</span>
+                    <span class="nav-title">Token 生成与传递 →</span>
+                </a>
+            </div>
+        </main>
+    </div>
+
+    <script>
+        hljs.highlightAll();
+        mermaid.initialize({
+            startOnLoad: true,
+            theme: 'dark',
+            themeVariables: {
+                darkMode: true,
+                background: '#161b22',
+                primaryColor: '#58a6ff',
+                primaryTextColor: '#c9d1d9',
+                primaryBorderColor: '#30363d',
+                lineColor: '#8b949e',
+                secondaryColor: '#21262d',
+                tertiaryColor: '#161b22'
+            }
+        });
+    </script>
+</body>
+</html>

@@ -1,0 +1,230 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>vLLM Speculative Decoding - 推测解码详解</title>
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/styles/github-dark.min.css">
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/highlight.min.js"></script>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/languages/python.min.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/mermaid@10/dist/mermaid.min.js"></script>
+    <link rel="stylesheet" href="../styles.css">
+</head>
+<body>
+    <div class="container">
+        <nav class="sidebar">
+            <a href="../index.html" class="back-to-home">← 返回主页</a>
+            <div class="sidebar-header">
+                <h1>Speculative Decoding</h1>
+                <p>推测解码技术详解</p>
+            </div>
+            <div class="nav-section">
+                <div class="nav-section-title">文档目录</div>
+                <a href="index.html" class="nav-item active"><span class="nav-item-number">00</span>概述</a>
+                <a href="01-architecture.html" class="nav-item"><span class="nav-item-number">01</span>架构设计</a>
+                <a href="02-methods.html" class="nav-item"><span class="nav-item-number">02</span>支持的方法</a>
+                <a href="03-token-flow.html" class="nav-item"><span class="nav-item-number">03</span>Token 生成与传递</a>
+                <a href="04-scheduler.html" class="nav-item"><span class="nav-item-number">04</span>Scheduler 调度</a>
+                <a href="05-rejection-sample.html" class="nav-item"><span class="nav-item-number">05</span>拒绝采样</a>
+                <a href="06-draft-propose.html" class="nav-item"><span class="nav-item-number">06</span>Draft Token 生成</a>
+                <a href="07-config.html" class="nav-item"><span class="nav-item-number">07</span>配置参数</a>
+                <a href="08-summary.html" class="nav-item"><span class="nav-item-number">08</span>流程总结</a>
+            </div>
+        </nav>
+
+        <main class="main-content">
+            <h1>vLLM Speculative Decoding - 推测解码详解</h1>
+
+            <h2>概述</h2>
+            <p>
+                Speculative Decoding（推测解码，简称 Spec Decode）是一种加速 LLM 推理的技术。
+                其核心思想是使用一个较小的"草稿模型"（draft model）或更轻量的方法快速生成多个候选 token，
+                然后使用原始"目标模型"（target model）并行验证这些候选 token。
+            </p>
+
+            <h2>核心优势</h2>
+            <div class="code-block">
+                <pre><code>传统解码：    [T1] → [T2] → [T3] → [T4] → [T5]  (5 次串行 forward)
+Spec Decode:  [D1,D2,D3,D4] → 验证 → [T1,T2✓,T3✓,T4✗,T5]  (2 次 forward, 接受 3 个)</code></pre>
+            </div>
+
+            <p><strong>关键指标</strong>：</p>
+            <ul>
+                <li><strong>Acceptance Rate（接受率）</strong>：草稿 token 被接受的比例</li>
+                <li><strong>Acceptance Length（接受长度）</strong>：每次迭代平均接受的 token 数（含 bonus token）</li>
+                <li><strong>Speedup</strong>：理想情况下可达 <code>num_spec_tokens + 1</code> 倍加速</li>
+            </ul>
+
+            <h2>核心概念</h2>
+            <table>
+                <thead>
+                    <tr>
+                        <th>术语</th>
+                        <th>含义</th>
+                    </tr>
+                </thead>
+                <tbody>
+                    <tr>
+                        <td><strong>Draft Tokens（草稿 token）</strong></td>
+                        <td>由草稿模型或推测方法生成的候选 token</td>
+                    </tr>
+                    <tr>
+                        <td><strong>Target Tokens（目标 token）</strong></td>
+                        <td>由目标模型生成的 token</td>
+                    </tr>
+                    <tr>
+                        <td><strong>Accepted Tokens（接受 token）</strong></td>
+                        <td>通过验证被接受的草稿 token</td>
+                    </tr>
+                    <tr>
+                        <td><strong>Rejected Tokens（拒绝 token）</strong></td>
+                        <td>未通过验证被拒绝的草稿 token</td>
+                    </tr>
+                    <tr>
+                        <td><strong>Bonus Token（奖励 token）</strong></td>
+                        <td>当所有草稿 token 都被接受时，从目标分布额外采样的一个 token</td>
+                    </tr>
+                    <tr>
+                        <td><strong>Recovered Tokens（恢复 token）</strong></td>
+                        <td>当草稿 token 被拒绝时，根据调整后分布采样的 token</td>
+                    </tr>
+                </tbody>
+            </table>
+
+            <h2>Rejection Sampling（拒绝采样）算法</h2>
+            <p>vLLM 实现了标准的拒绝采样算法，核心公式：</p>
+            <div class="code-block">
+                <pre><code>对于每个草稿 token γ，接受概率 = min(1, P_target(γ) / P_draft(γ))</code></pre>
+            </div>
+
+            <p><strong>算法流程</strong>：</p>
+            <ol>
+                <li>草稿模型生成 k 个 token: γ₁, γ₂, ..., γₖ</li>
+                <li>目标模型计算所有位置的分布：P_target(·|x, γ₁:i-1)</li>
+                <li>对每个位置进行拒绝采样：
+                    <ul>
+                        <li>以概率 min(1, P_target(γᵢ) / P_draft(γᵢ)) 接受</li>
+                        <li>如果拒绝，从调整分布采样恢复 token</li>
+                    </ul>
+                </li>
+                <li>如果全部接受，额外采样一个 bonus token</li>
+            </ol>
+
+            <h2>系统架构图</h2>
+            <div class="mermaid">
+            graph TB
+                A[Input Batch] --> B[Scheduler]
+                B --> C[Draft Proposer]
+                C --> D{Speculative Method}
+                D --> E[EAGLE]
+                D --> F[MTP]
+                D --> G[Ngram]
+                D --> H[Suffix]
+                E --> I[Target Model]
+                F --> I
+                G --> I
+                H --> I
+                I --> J[RejectionSampler]
+                J --> K[Output Tokens]
+            </div>
+
+            <h2>支持的方法对比</h2>
+            <table>
+                <thead>
+                    <tr>
+                        <th>方法</th>
+                        <th>是否需要额外模型</th>
+                        <th>优点</th>
+                        <th>缺点</th>
+                    </tr>
+                </thead>
+                <tbody>
+                    <tr>
+                        <td><strong>EAGLE</strong></td>
+                        <td>是 (EAGLE head)</td>
+                        <td>高接受率，速度快</td>
+                        <td>需要训练额外 head</td>
+                    </tr>
+                    <tr>
+                        <td><strong>EAGLE3</strong></td>
+                        <td>是 (EAGLE3 head)</td>
+                        <td>改进的 EAGLE，更高接受率</td>
+                        <td>需要特定模型支持</td>
+                    </tr>
+                    <tr>
+                        <td><strong>MTP</strong></td>
+                        <td>否 (内置)</td>
+                        <td>无需额外模型，集成度高</td>
+                        <td>仅支持特定架构</td>
+                    </tr>
+                    <tr>
+                        <td><strong>Ngram</strong></td>
+                        <td>否</td>
+                        <td>无需模型，简单快速</td>
+                        <td>接受率较低</td>
+                    </tr>
+                    <tr>
+                        <td><strong>Suffix Decoding</strong></td>
+                        <td>否</td>
+                        <td>利用历史缓存，无训练</td>
+                        <td>需要额外依赖</td>
+                    </tr>
+                    <tr>
+                        <td><strong>Draft Model</strong></td>
+                        <td>是 (完整模型)</td>
+                        <td>灵活，可自定义</td>
+                        <td>资源开销大</td>
+                    </tr>
+                </tbody>
+            </table>
+
+            <h2>文档结构</h2>
+            <p>本文档系列包含以下章节：</p>
+            <ol>
+                <li><strong>架构设计</strong>：系统架构和数据流详解</li>
+                <li><strong>支持的方法</strong>：EAGLE、MTP、Ngram、Suffix 等方法详解</li>
+                <li><strong>Token 生成与传递</strong>：完整的 token 数据流分析</li>
+                <li><strong>Scheduler 调度</strong>：调度器如何管理 draft tokens</li>
+                <li><strong>拒绝采样</strong>：RejectionSampler 实现细节</li>
+                <li><strong>Draft Token 生成</strong>：Proposer 工作机制</li>
+                <li><strong>配置参数</strong>：配置选项和性能调优</li>
+                <li><strong>流程总结</strong>：完整调用链回顾</li>
+            </ol>
+
+            <div class="highlight-box">
+                <h4>关键点</h4>
+                <p>
+                    Speculative Decoding 通过并行验证草稿 token 来减少串行 forward 次数，
+                    在保持输出分布不变的前提下显著提升推理速度。理解各个组件的协作机制
+                    对于优化配置和性能调优至关重要。
+                </p>
+            </div>
+
+            <div class="chapter-nav">
+                <a href="01-architecture.html" class="next-chapter">
+                    <span class="nav-label">下一章</span>
+                    <span class="nav-title">架构设计 →</span>
+                </a>
+            </div>
+        </main>
+    </div>
+
+    <script>
+        hljs.highlightAll();
+        mermaid.initialize({
+            startOnLoad: true,
+            theme: 'dark',
+            themeVariables: {
+                darkMode: true,
+                background: '#161b22',
+                primaryColor: '#58a6ff',
+                primaryTextColor: '#c9d1d9',
+                primaryBorderColor: '#30363d',
+                lineColor: '#8b949e',
+                secondaryColor: '#21262d',
+                tertiaryColor: '#161b22'
+            }
+        });
+    </script>
+</body>
+</html>

@@ -1,0 +1,232 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>流程总结 - Speculative Decoding</title>
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/styles/github-dark.min.css">
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/highlight.min.js"></script>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/languages/python.min.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/mermaid@10/dist/mermaid.min.js"></script>
+    <link rel="stylesheet" href="../styles.css">
+</head>
+<body>
+    <div class="container">
+        <nav class="sidebar">
+            <a href="../index.html" class="back-to-home">← 返回主页</a>
+            <div class="sidebar-header">
+                <h1>Speculative Decoding</h1>
+                <p>推测解码技术详解</p>
+            </div>
+            <div class="nav-section">
+                <div class="nav-section-title">文档目录</div>
+                <a href="index.html" class="nav-item"><span class="nav-item-number">00</span>概述</a>
+                <a href="01-architecture.html" class="nav-item"><span class="nav-item-number">01</span>架构设计</a>
+                <a href="02-methods.html" class="nav-item"><span class="nav-item-number">02</span>支持的方法</a>
+                <a href="03-token-flow.html" class="nav-item"><span class="nav-item-number">03</span>Token 生成与传递</a>
+                <a href="04-scheduler.html" class="nav-item"><span class="nav-item-number">04</span>Scheduler 调度</a>
+                <a href="05-rejection-sample.html" class="nav-item"><span class="nav-item-number">05</span>拒绝采样</a>
+                <a href="06-draft-propose.html" class="nav-item"><span class="nav-item-number">06</span>Draft Token 生成</a>
+                <a href="07-config.html" class="nav-item"><span class="nav-item-number">07</span>配置参数</a>
+                <a href="08-summary.html" class="nav-item active"><span class="nav-item-number">08</span>流程总结</a>
+            </div>
+        </nav>
+
+        <main class="main-content">
+            <h1>流程总结</h1>
+
+            <h2>完整调用链</h2>
+            <div class="mermaid">
+            sequenceDiagram
+                participant S as Scheduler
+                participant MR as ModelRunner
+                participant TM as Target Model
+                participant RS as RejectionSampler
+                participant DP as Draft Proposer
+
+                Note over S,DP: 第 N 轮推理
+
+                S->>MR: schedule() <br/>scheduled_spec_decode_tokens
+                MR->>MR: _prepare_inputs() <br/>SpecDecodeMetadata
+                MR->>TM: forward() <br/>hidden_states, logits
+                MR->>MR: save ExecuteModelState
+
+                Note over MR: sample_tokens()
+
+                MR->>RS: rejection_sampler() <br/>sampled_token_ids
+                RS->>DP: propose_draft_token_ids() <br/>new_draft_tokens
+                DP->>MR: draft_token_ids
+                MR->>S: update_draft_token_ids() <br/>request.spec_token_ids
+
+                Note over S,DP: 第 N+1 轮推理
+            </div>
+
+            <h2>数据结构与传递路径</h2>
+            <table>
+                <thead>
+                    <tr>
+                        <th>阶段</th>
+                        <th>Token 类型</th>
+                        <th>数据结构</th>
+                        <th>传递路径</th>
+                    </tr>
+                </thead>
+                <tbody>
+                    <tr>
+                        <td><strong>Scheduler</strong></td>
+                        <td>Draft tokens（上一轮生成）</td>
+                        <td><code>scheduled_spec_decode_tokens: dict[str, list[int]]</code></td>
+                        <td>Scheduler → ModelRunner（通过 SchedulerOutput）</td>
+                    </tr>
+                    <tr>
+                        <td><strong>Execute Model</strong></td>
+                        <td>Target model 计算</td>
+                        <td><code>SpecDecodeMetadata</code></td>
+                        <td><code>execute_model</code> → <code>sample_tokens</code>（通过 <code>ExecuteModelState</code>）</td>
+                    </tr>
+                    <tr>
+                        <td><strong>Sample Tokens</strong></td>
+                        <td>Accepted tokens + Bonus</td>
+                        <td><code>sampled_token_ids: Tensor[batch_size, num_accepted+1]</code></td>
+                        <td><code>rejection_sampler</code> → <code>propose_draft_token_ids</code></td>
+                    </tr>
+                    <tr>
+                        <td><strong>Propose</strong></td>
+                        <td>新一轮 Draft tokens</td>
+                        <td><code>draft_token_ids: list[list[int]]</code></td>
+                        <td><code>draft_model</code> → scheduler（<code>request.spec_token_ids</code>）</td>
+                    </tr>
+                </tbody>
+            </table>
+
+            <h2>核心机制</h2>
+
+            <h3>1. 延迟验证</h3>
+            <p>
+                draft model 生成的 token 不会立即使用，而是缓存到 <code>request.spec_token_ids</code>，
+                下一轮才被 target model 验证。
+            </p>
+
+            <h3>2. Hidden States 复用</h3>
+            <p>
+                draft model 使用 target model 的 hidden states 作为输入，避免重复计算。
+            </p>
+
+            <h3>3. Async Scheduling</h3>
+            <p>
+                支持异步调度，draft token 的生成可以和 target model 的计算并行。
+            </p>
+
+            <h3>4. SpecDecodeMetadata 结构</h3>
+            <div class="code-block">
+                <pre><code class="language-python">SpecDecodeMetadata(
+    draft_token_ids=draft_token_ids,         # draft token 的 ID
+    num_draft_tokens=num_draft_tokens,       # 每个 request 的 draft 数量
+    cu_num_draft_tokens=cu_num_draft_tokens, # 累计 draft tokens
+    cu_num_sampled_tokens=cu_num_sampled_tokens, # 累计 sampled tokens
+    target_logits_indices=target_logits_indices, # target 位置索引
+    logits_indices=logits_indices,           # logits 计算位置
+    bonus_logits_indices=bonus_logits_indices,   # bonus token 索引
+)</code></pre>
+            </div>
+
+            <h2>关键要点</h2>
+
+            <div class="highlight-box">
+                <h4>关键点</h4>
+                <ul>
+                    <li><strong>Speculative Decoding 的核心</strong>：用草稿模型快速生成多个 token，用目标模型并行验证</li>
+                    <li><strong>接受率是关键指标</strong>：接受率越高，加速效果越好</li>
+                    <li><strong>num_speculative_tokens 需要调优</strong>：太大导致接受率下降，太小加速效果有限</li>
+                    <li><strong>不同方法适用于不同场景</strong>：
+                        <ul>
+                            <li>EAGLE：高接受率，需要额外训练</li>
+                            <li>MTP：集成度高，仅支持特定模型</li>
+                            <li>Ngram：简单快速，接受率较低</li>
+                            <li>Suffix：利用缓存，适合重复模式</li>
+                        </ul>
+                    </li>
+                </ul>
+            </div>
+
+            <h2>vllm-ascend 实现特点</h2>
+            <ul>
+                <li><strong>EAGLE 方法优化</strong>：支持 GPU padded batch 模式，可以使用 GPU sampled tokens 直接作为输入</li>
+                <li><strong>ACL Graph 支持</strong>：支持 ACL Graph 捕获和重放，提高推理性能</li>
+                <li><strong>PCP/DCP 分布式支持</strong>：支持 Prefill Context Parallel 和 Decode Context Parallel</li>
+            </ul>
+
+            <h2>相关文件索引</h2>
+            <table>
+                <thead>
+                    <tr>
+                        <th>文件路径</th>
+                        <th>主要功能</th>
+                    </tr>
+                </thead>
+                <tbody>
+                    <tr>
+                        <td><code>vllm/v1/core/sched/scheduler.py</code></td>
+                        <td>Scheduler 核心逻辑，生成 <code>scheduled_spec_decode_tokens</code></td>
+                    </tr>
+                    <tr>
+                        <td><code>vllm/v1/core/sched/output.py</code></td>
+                        <td><code>SchedulerOutput</code>、<code>CachedRequestData</code> 数据结构定义</td>
+                    </tr>
+                    <tr>
+                        <td><code>vllm/v1/request.py</code></td>
+                        <td><code>Request</code> 类，包含 <code>spec_token_ids</code> 状态管理</td>
+                    </tr>
+                    <tr>
+                        <td><code>vllm/v1/spec_decode/metadata.py</code></td>
+                        <td><code>SpecDecodeMetadata</code> 数据结构定义</td>
+                    </tr>
+                    <tr>
+                        <td><code>vllm/v1/sample/rejection_sampler.py</code></td>
+                        <td>RejectionSampler 实现</td>
+                    </tr>
+                    <tr>
+                        <td><code>vllm_ascend/worker/model_runner_v1.py</code></td>
+                        <td><code>execute_model</code> 和 <code>sample_tokens</code> 主逻辑</td>
+                    </tr>
+                    <tr>
+                        <td><code>vllm_ascend/spec_decode/eagle_proposer.py</code></td>
+                        <td>EAGLE draft model 实现</td>
+                    </tr>
+                    <tr>
+                        <td><code>vllm_ascend/spec_decode/mtp_proposer.py</code></td>
+                        <td>MTP (Multi-Token Prediction) 实现</td>
+                    </tr>
+                    <tr>
+                        <td><code>vllm_ascend/spec_decode/ngram_proposer.py</code></td>
+                        <td>N-gram 基于规则的 draft</td>
+                    </tr>
+                </tbody>
+            </table>
+
+            <div class="chapter-nav">
+                <a href="07-config.html" class="prev-chapter">← 上一章</a>
+                <a href="../index.html" class="back-to-home">← 返回主页</a>
+            </div>
+        </main>
+    </div>
+
+    <script>
+        hljs.highlightAll();
+        mermaid.initialize({
+            startOnLoad: true,
+            theme: 'dark',
+            themeVariables: {
+                darkMode: true,
+                background: '#161b22',
+                primaryColor: '#58a6ff',
+                primaryTextColor: '#c9d1d9',
+                primaryBorderColor: '#30363d',
+                lineColor: '#8b949e',
+                secondaryColor: '#21262d',
+                tertiaryColor: '#161b22'
+            }
+        });
+    </script>
+</body>
+</html>

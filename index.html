@@ -4,6 +4,9 @@
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>vLLM Ascend Study - 目录索引</title>
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500&family=Space+Grotesk:wght@500;600;700&display=swap" rel="stylesheet">
     <link rel="stylesheet" href="styles.css">
 </head>
 <body>
@@ -17,87 +20,111 @@
         </header>
 
         <main class="index-content">
-            <section class="cards-section">
-                <h2 class="section-title">学习目录</h2>
-                <div class="cards-grid">
-                    <a href="./NPUModelRunner_execute_model/index.html" class="card">
-                        <div class="card-icon">
-                            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
-                                <rect x="4" y="4" width="16" height="16" rx="2"/>
-                                <path d="M9 9h6M9 12h6M9 15h4"/>
-                            </svg>
-                        </div>
-                        <div class="card-content">
-                            <h3>NPUModelRunner::execute_model</h3>
-                            <p>模型执行流程分析 - 从输入到输出的完整推理过程</p>
-                        </div>
-                        <div class="card-arrow">
-                            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
-                                <path d="M5 12h14M12 5l7 7-7 7"/>
-                            </svg>
-                        </div>
-                    </a>
+            <div class="main-split">
+                <!-- 左侧：方法实现分析 -->
+                <section class="split-panel left-panel">
+                    <h2 class="panel-title">方法实现分析</h2>
+                    <div class="cards-grid">
+                        <a href="./NPUModelRunner_execute_model/index.html" class="card">
+                            <div class="card-icon">
+                                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                                    <rect x="4" y="4" width="16" height="16" rx="2"/>
+                                    <path d="M9 9h6M9 12h6M9 15h4"/>
+                                </svg>
+                            </div>
+                            <div class="card-content">
+                                <h3>NPUModelRunner::execute_model</h3>
+                                <p>模型执行流程分析 - 从输入到输出的完整推理过程</p>
+                            </div>
+                            <div class="card-arrow">
+                                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                                    <path d="M5 12h14M12 5l7 7-7 7"/>
+                                </svg>
+                            </div>
+                        </a>
 
-                    <a href="./NPUWorker_get_kv_cache_spec/index.html" class="card">
-                        <div class="card-icon">
-                            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
-                                <rect x="3" y="3" width="7" height="7"/>
-                                <rect x="14" y="3" width="7" height="7"/>
-                                <rect x="14" y="14" width="7" height="7"/>
-                                <rect x="3" y="14" width="7" height="7"/>
-                            </svg>
-                        </div>
-                        <div class="card-content">
-                            <h3>NPUWorker::get_kv_cache_spec</h3>
-                            <p>KV Cache 规范获取流程 - 内存管理的核心环节</p>
-                        </div>
-                        <div class="card-arrow">
-                            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
-                                <path d="M5 12h14M12 5l7 7-7 7"/>
-                            </svg>
-                        </div>
-                    </a>
+                        <a href="./NPUWorker_get_kv_cache_spec/index.html" class="card">
+                            <div class="card-icon">
+                                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                                    <rect x="3" y="3" width="7" height="7"/>
+                                    <rect x="14" y="3" width="7" height="7"/>
+                                    <rect x="14" y="14" width="7" height="7"/>
+                                    <rect x="3" y="14" width="7" height="7"/>
+                                </svg>
+                            </div>
+                            <div class="card-content">
+                                <h3>NPUWorker::get_kv_cache_spec</h3>
+                                <p>KV Cache 规范获取流程 - 内存管理的核心环节</p>
+                            </div>
+                            <div class="card-arrow">
+                                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                                    <path d="M5 12h14M12 5l7 7-7 7"/>
+                                </svg>
+                            </div>
+                        </a>
 
-                    <a href="./NPUWorker_initialize_from_config/index.html" class="card">
-                        <div class="card-icon">
-                            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
-                                <path d="M12 2L2 7l10 5 10-5-10-5z"/>
-                                <path d="M2 17l10 5 10-5"/>
-                                <path d="M2 12l10 5 10-5"/>
-                            </svg>
-                        </div>
-                        <div class="card-content">
-                            <h3>NPUWorker::initialize_from_config</h3>
-                            <p>KV Cache 初始化流程 - 从内存分配到绑定的完整调用链</p>
-                        </div>
-                        <div class="card-arrow">
-                            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
-                                <path d="M5 12h14M12 5l7 7-7 7"/>
-                            </svg>
-                        </div>
-                    </a>
+                        <a href="./NPUWorker_initialize_from_config/index.html" class="card">
+                            <div class="card-icon">
+                                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                                    <path d="M12 2L2 7l10 5 10-5-10-5z"/>
+                                    <path d="M2 17l10 5 10-5"/>
+                                    <path d="M2 12l10 5 10-5"/>
+                                </svg>
+                            </div>
+                            <div class="card-content">
+                                <h3>NPUWorker::initialize_from_config</h3>
+                                <p>KV Cache 初始化流程 - 从内存分配到绑定的完整调用链</p>
+                            </div>
+                            <div class="card-arrow">
+                                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                                    <path d="M5 12h14M12 5l7 7-7 7"/>
+                                </svg>
+                            </div>
+                        </a>
+                    </div>
+                </section>
 
-                    <!-- 更多卡片可以在这里添加 -->
-                    <!--
-                    <a href="./other_topic/" class="card">
-                        <div class="card-icon">
-                            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
-                                ... SVG path ...
-                            </svg>
+                <!-- 右侧：技术特性 -->
+                <section class="split-panel right-panel">
+                    <h2 class="panel-title">技术特性</h2>
+                    <div class="cards-grid">
+                        <a href="./spec_decode/index.html" class="card">
+                            <div class="card-icon">
+                                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                                    <path d="M13 2L3 14h9l-1 8 10-12h-9l1-8z"/>
+                                </svg>
+                            </div>
+                            <div class="card-content">
+                                <h3>Speculative Decoding</h3>
+                                <p>推测解码技术详解 - EAGLE/MTP/Ngram 等方法原理与实现</p>
+                            </div>
+                            <div class="card-arrow">
+                                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                                    <path d="M5 12h14M12 5l7 7-7 7"/>
+                                </svg>
+                            </div>
+                        </a>
+
+                        <div class="card placeholder-card">
+                            <div class="card-icon">
+                                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                                    <circle cx="12" cy="12" r="10"/>
+                                    <path d="M12 6v6l4 2"/>
+                                </svg>
+                            </div>
+                            <div class="card-content">
+                                <h3>更多特性 coming soon</h3>
+                                <p>持续关注，更多精彩内容陆续上线</p>
+                            </div>
+                            <div class="card-arrow">
+                                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                                    <circle cx="12" cy="12" r="3"/>
+                                </svg>
+                            </div>
                         </div>
-                        <div class="card-content">
-                            <h3>其他主题</h3>
-                            <p>描述信息</p>
-                        </div>
-                        <div class="card-arrow">
-                            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
-                                <path d="M5 12h14M12 5l7 7-7 7"/>
-                            </svg>
-                        </div>
-                    </a>
-                    -->
-                </div>
-            </section>
+                    </div>
+                </section>
+            </div>
 
             <section class="info-section">
                 <div class="info-card">

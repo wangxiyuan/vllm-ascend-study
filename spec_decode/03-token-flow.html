@@ -1,0 +1,343 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Token 生成与传递流程 - Speculative Decoding</title>
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/styles/github-dark.min.css">
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/highlight.min.js"></script>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/languages/python.min.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/mermaid@10/dist/mermaid.min.js"></script>
+    <link rel="stylesheet" href="../styles.css">
+</head>
+<body>
+    <div class="container">
+        <nav class="sidebar">
+            <a href="../index.html" class="back-to-home">← 返回主页</a>
+            <div class="sidebar-header">
+                <h1>Speculative Decoding</h1>
+                <p>推测解码技术详解</p>
+            </div>
+            <div class="nav-section">
+                <div class="nav-section-title">文档目录</div>
+                <a href="index.html" class="nav-item"><span class="nav-item-number">00</span>概述</a>
+                <a href="01-architecture.html" class="nav-item"><span class="nav-item-number">01</span>架构设计</a>
+                <a href="02-methods.html" class="nav-item"><span class="nav-item-number">02</span>支持的方法</a>
+                <a href="03-token-flow.html" class="nav-item active"><span class="nav-item-number">03</span>Token 生成与传递</a>
+                <a href="04-scheduler.html" class="nav-item"><span class="nav-item-number">04</span>Scheduler 调度</a>
+                <a href="05-rejection-sample.html" class="nav-item"><span class="nav-item-number">05</span>拒绝采样</a>
+                <a href="06-draft-propose.html" class="nav-item"><span class="nav-item-number">06</span>Draft Token 生成</a>
+                <a href="07-config.html" class="nav-item"><span class="nav-item-number">07</span>配置参数</a>
+                <a href="08-summary.html" class="nav-item"><span class="nav-item-number">08</span>流程总结</a>
+            </div>
+        </nav>
+
+        <main class="main-content">
+            <h1>Token 生成与传递流程</h1>
+
+            <h2>完整数据流图</h2>
+            <div class="mermaid">
+            graph TB
+                subgraph S1["第 N 轮推理"]
+                    A[Scheduler] -->|scheduled_spec_decode_tokens| B[ModelRunner]
+                    B -->|SpecDecodeMetadata| C[Target Model]
+                    C -->|hidden_states, logits| D[RejectionSampler]
+                    D -->|sampled_token_ids| E[Draft Proposer]
+                    E -->|new_draft_tokens| F[Scheduler 更新]
+                end
+
+                F -->|spec_token_ids| G[第 N+1 轮推理]
+            </div>
+
+            <h2>第一阶段：Scheduler 调度</h2>
+            <p><strong>位置</strong>: <code>vllm/v1/core/sched/scheduler.py:494-510</code></p>
+
+            <h3>核心数据结构</h3>
+            <div class="code-block">
+                <pre><code class="language-python">class Request:
+    self.spec_token_ids: list[int] = []  # 存储 draft model 生成的待验证 tokens
+    self.num_computed_tokens = 0  # 已计算的 token 数
+    self.num_tokens = len(prompt) + len(output)  # prompt + output tokens
+
+@dataclass
+class SchedulerOutput:
+    scheduled_spec_decode_tokens: dict[str, list[int]]  # req_id -> [draft_token_1, draft_token_2, ...]</code></pre>
+            </div>
+
+            <h3>Scheduler 调度流程</h3>
+            <div class="code-block">
+                <pre><code class="language-python">def schedule(self) -> SchedulerOutput:
+    scheduled_spec_decode_tokens: dict[str, list[int]] = {}
+
+    for request in scheduled_running_reqs:
+        # ... (省略 block 分配等逻辑)
+
+        # ============= Speculative Decode 相关 =============
+        if request.spec_token_ids:
+            # 计算需要调度的 spec token 数量
+            num_scheduled_spec_tokens = (
+                num_new_tokens           # 本轮调度的新 token 数
+                + request.num_computed_tokens  # 已计算的 token 数
+                - request.num_tokens         # prompt + output tokens
+                - request.num_output_placeholders  # 异步调度中的占位符
+            )
+
+            if num_scheduled_spec_tokens > 0:
+                # 裁剪 spec_token_ids 到正确长度
+                spec_token_ids = request.spec_token_ids
+                if len(spec_token_ids) > num_scheduled_spec_tokens:
+                    spec_token_ids = spec_token_ids[:num_scheduled_spec_tokens]
+
+                # 添加到 scheduled_spec_decode_tokens
+                scheduled_spec_decode_tokens[request.request_id] = spec_token_ids
+
+            # 清空 request 的 spec_token_ids（将在下一轮被更新）
+            request.spec_token_ids = []
+
+    return SchedulerOutput(
+        scheduled_spec_decode_tokens=scheduled_spec_decode_tokens,
+        ...
+    )</code></pre>
+            </div>
+
+            <h2>第二阶段：Execute Model</h2>
+            <p><strong>位置</strong>: <code>vllm_ascend/worker/model_runner_v1.py:750-823</code></p>
+
+            <h3>2.1 _prepare_inputs：构建 SpecDecodeMetadata</h3>
+            <div class="code-block">
+                <pre><code class="language-python">def _prepare_inputs(
+    self,
+    scheduler_output: "SchedulerOutput",
+    num_scheduled_tokens: np.ndarray,
+) -> tuple[logits_indices, spec_decode_metadata, total_num_scheduled_tokens]:
+    # 从 scheduler_output 获取 draft tokens
+    scheduled_spec_decode_tokens = scheduler_output.scheduled_spec_decode_tokens
+
+    if scheduled_spec_decode_tokens:
+        # 计算每个 request 的 draft token 数量
+        for req_idx, req_id in enumerate(self.input_batch.req_ids):
+            if req_id in scheduled_spec_decode_tokens:
+                spec_token_ids = scheduled_spec_decode_tokens[req_id]
+                num_draft_tokens[req_idx] = len(spec_token_ids)
+
+        # 计算 logits 索引
+        logits_indices = ...
+        target_logits_indices = ...
+
+        # 从 input_ids 中提取 draft token IDs
+        draft_token_ids = self.input_ids.gpu[logits_indices]
+        draft_token_ids = draft_token_ids[target_logits_indices + 1]
+
+        spec_decode_metadata = SpecDecodeMetadata(
+            draft_token_ids=draft_token_ids,
+            num_draft_tokens=num_draft_tokens.tolist(),
+            cu_num_draft_tokens=cu_num_draft_tokens,
+            cu_num_sampled_tokens=cu_num_sampled_tokens,
+            target_logits_indices=target_logits_indices,
+            bonus_logits_indices=bonus_logits_indices,
+            logits_indices=logits_indices,
+        )
+
+    return logits_indices, spec_decode_metadata, ...</code></pre>
+            </div>
+
+            <h3>2.2 Target Model 前向传播</h3>
+            <div class="code-block">
+                <pre><code class="language-python">def execute_model(self, scheduler_output: "SchedulerOutput", ...) -> ModelRunnerOutput | None:
+    # 1. _prepare_inputs() 构建 SpecDecodeMetadata
+    logits_indices, spec_decode_metadata, ... = self._prepare_inputs(...)
+
+    # 2. Target Model 前向传播
+    with set_ascend_forward_context(...):
+        hidden_states = self._model_forward(...)
+
+    # 3. 计算 logits（只在需要的位置）
+    sample_hidden_states = hidden_states[logits_indices]
+    logits = self.model.compute_logits(sample_hidden_states)
+
+    # 4. 保存状态到 ExecuteModelState（传递给 sample_tokens）
+    self.execute_model_state = ExecuteModelState(
+        scheduler_output=scheduler_output,
+        logits=logits,
+        spec_decode_metadata=spec_decode_metadata,
+        spec_decode_common_attn_metadata=spec_decode_common_attn_metadata,
+        hidden_states=hidden_states,
+        sample_hidden_states=sample_hidden_states,
+        aux_hidden_states=aux_hidden_states,
+        attn_metadata=attn_metadata,
+        positions=positions,
+        ec_connector_output=ec_connector_output,
+        cudagraph_stats=cudagraph_stats,
+    )
+
+    return None  # 返回 None，等待 sample_tokens 调用</code></pre>
+            </div>
+
+            <h2>第三阶段：Sample Tokens</h2>
+            <p><strong>位置</strong>: <code>vllm_ascend/worker/model_runner_v1.py:1397-1495</code></p>
+
+            <h3>3.1 恢复状态并采样</h3>
+            <div class="code-block">
+                <pre><code class="language-python">def sample_tokens(self, grammar_output: "GrammarOutput | None") -> ModelRunnerOutput:
+    # 恢复 execute_model 保存的状态
+    (
+        scheduler_output,
+        logits,
+        spec_decode_metadata,
+        spec_decode_common_attn_metadata,
+        hidden_states,
+        sample_hidden_states,
+        aux_hidden_states,
+        attn_metadata,
+        positions,
+        ec_connector_output,
+        cudagraph_stats,
+    ) = self.execute_model_state
+
+    self.execute_model_state = None
+
+    # 使用 RejectionSampler 进行 token 验证
+    with record_function_or_nullcontext("sample_token"):
+        sampler_output = self._sample(logits, spec_decode_metadata)</code></pre>
+            </div>
+
+            <h3>3.2 Rejection Sampling 核心逻辑</h3>
+            <div class="code-block">
+                <pre><code class="language-python">def _sample(self, logits, spec_decode_metadata):
+    sampling_metadata = self.input_batch.sampling_metadata
+
+    if spec_decode_metadata is None:
+        # 普通采样（无 spec decode）
+        return self.sampler(logits=logits, sampling_metadata=sampling_metadata)
+
+    # Spec decode 采样：验证 draft token
+    if lmhead_tp_enable() and logits is not None:
+        logits = logits[: len(spec_decode_metadata.logits_indices)]
+
+    sampler_output = self.rejection_sampler(
+        spec_decode_metadata,
+        None,  # draft_probs
+        logits,       # target model 的 logits [num_tokens + batch_size, vocab_size]
+        sampling_metadata,
+    )
+    return sampler_output</code></pre>
+            </div>
+
+            <h3>3.3 Propose Draft Token IDs：生成下一轮的 draft tokens</h3>
+            <div class="code-block">
+                <pre><code class="language-python">def propose_draft_token_ids(sampled_token_ids):
+    assert spec_decode_common_attn_metadata is not None
+    self._draft_token_ids = self.propose_draft_token_ids(
+        sampled_token_ids,              # 刚采样的 tokens（accepted + 1 个新 token）
+        self.input_batch.sampling_metadata,
+        scheduler_output,
+        spec_decode_metadata,
+        spec_decode_common_attn_metadata,
+        positions,
+        scheduler_output.total_num_scheduled_tokens,
+        hidden_states,                  # target model 的 hidden states
+        attn_metadata,
+        aux_hidden_states,
+        sample_hidden_states,
+    )
+    self._copy_draft_token_ids_to_cpu(scheduler_output)</code></pre>
+            </div>
+
+            <h2>第四阶段：Scheduler 状态更新</h2>
+            <p><strong>位置</strong>: <code>vllm/v1/core/sched/scheduler.py:1297-1345</code></p>
+
+            <h3>4.1 update_from_output：更新 request 状态</h3>
+            <div class="code-block">
+                <pre><code class="language-python">def update_from_output(
+    self,
+    scheduler_output: SchedulerOutput,
+    model_runner_output: ModelRunnerOutput,
+) -> dict[int, EngineCoreOutputs]:
+    sampled_token_ids = model_runner_output.sampled_token_ids
+
+    for req_id, request in self.requests.items():
+        if request.is_finished():
+            continue
+
+        req_index = model_runner_output.req_id_to_index[req_id]
+        generated_token_ids = sampled_token_ids[req_index] if sampled_token_ids else []
+
+        # ============= Speculative Decode 状态更新 =============
+        scheduled_spec_token_ids = scheduler_output.scheduled_spec_decode_tokens.get(req_id)
+
+        if scheduled_spec_token_ids and generated_token_ids:
+            num_draft_tokens = len(scheduled_spec_token_ids)
+            num_accepted = len(generated_token_ids) - 1  # 最后 1 个是 bonus token
+            num_rejected = num_draft_tokens - num_accepted
+
+            # num_computed_tokens 回退（因为 reject 的 token 需要重新计算）
+            if request.num_computed_tokens > 0:
+                request.num_computed_tokens -= num_rejected
+
+            # 异步调度时，num_output_placeholders 也需要回退
+            if request.num_output_placeholders > 0:
+                request.num_output_placeholders -= num_rejected
+
+        # 更新 request 的 token 列表
+        if generated_token_ids:
+            request.append_output_token_ids(generated_token_ids)</code></pre>
+            </div>
+
+            <h3>4.2 update_draft_token_ids：更新下一轮的 spec tokens</h3>
+            <div class="code-block">
+                <pre><code class="language-python">def update_draft_token_ids(self, draft_token_ids: DraftTokenIds) -> None:
+    """
+    在 model_runner 生成新的 draft tokens 后，更新到 scheduler 的 request 中
+    """
+    for req_id, spec_token_ids in zip(
+        draft_token_ids.req_ids,
+        draft_token_ids.draft_token_ids,
+    ):
+        request = self.requests.get(req_id)
+        if request is None or request.is_finished():
+            continue
+
+        if request.is_prefill_chunk:
+            # Prefill chunk 阶段忽略 draft tokens
+            if request.spec_token_ids:
+                request.spec_token_ids = []
+            continue
+
+        # 应用 grammar 验证（结构化输出场景）
+        if self.structured_output_manager.should_advance(request):
+            metadata = request.structured_output_request
+            spec_token_ids = metadata.grammar.validate_tokens(spec_token_ids)
+
+        # 更新 request 的 spec_token_ids
+        request.spec_token_ids = spec_token_ids</code></pre>
+            </div>
+
+            <div class="chapter-nav">
+                <a href="02-methods.html" class="prev-chapter">← 上一章</a>
+                <a href="04-scheduler.html" class="next-chapter">
+                    <span class="nav-label">下一章</span>
+                    <span class="nav-title">Scheduler 调度 →</span>
+                </a>
+            </div>
+        </main>
+    </div>
+
+    <script>
+        hljs.highlightAll();
+        mermaid.initialize({
+            startOnLoad: true,
+            theme: 'dark',
+            themeVariables: {
+                darkMode: true,
+                background: '#161b22',
+                primaryColor: '#58a6ff',
+                primaryTextColor: '#c9d1d9',
+                primaryBorderColor: '#30363d',
+                lineColor: '#8b949e',
+                secondaryColor: '#21262d',
+                tertiaryColor: '#161b22'
+            }
+        });
+    </script>
+</body>
+</html>

@@ -1,0 +1,207 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>拒绝采样 - Speculative Decoding</title>
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/styles/github-dark.min.css">
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/highlight.min.js"></script>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/languages/python.min.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/mermaid@10/dist/mermaid.min.js"></script>
+    <link rel="stylesheet" href="../styles.css">
+</head>
+<body>
+    <div class="container">
+        <nav class="sidebar">
+            <a href="../index.html" class="back-to-home">← 返回主页</a>
+            <div class="sidebar-header">
+                <h1>Speculative Decoding</h1>
+                <p>推测解码技术详解</p>
+            </div>
+            <div class="nav-section">
+                <div class="nav-section-title">文档目录</div>
+                <a href="index.html" class="nav-item"><span class="nav-item-number">00</span>概述</a>
+                <a href="01-architecture.html" class="nav-item"><span class="nav-item-number">01</span>架构设计</a>
+                <a href="02-methods.html" class="nav-item"><span class="nav-item-number">02</span>支持的方法</a>
+                <a href="03-token-flow.html" class="nav-item"><span class="nav-item-number">03</span>Token 生成与传递</a>
+                <a href="04-scheduler.html" class="nav-item"><span class="nav-item-number">04</span>Scheduler 调度</a>
+                <a href="05-rejection-sample.html" class="nav-item active"><span class="nav-item-number">05</span>拒绝采样</a>
+                <a href="06-draft-propose.html" class="nav-item"><span class="nav-item-number">06</span>Draft Token 生成</a>
+                <a href="07-config.html" class="nav-item"><span class="nav-item-number">07</span>配置参数</a>
+                <a href="08-summary.html" class="nav-item"><span class="nav-item-number">08</span>流程总结</a>
+            </div>
+        </nav>
+
+        <main class="main-content">
+            <h1>拒绝采样 (Rejection Sampling)</h1>
+
+            <h2>概述</h2>
+            <p>
+                RejectionSampler 是 Speculative Decoding 的核心组件，负责根据 target model 的 logits
+                决定接受或拒绝草稿 token。它实现了标准的拒绝采样算法，确保输出分布与原始模型一致。
+            </p>
+            <p><strong>位置</strong>: <code>vllm/v1/sample/rejection_sampler.py</code></p>
+
+            <h2>RejectionSampler 工作原理</h2>
+
+            <div class="mermaid">
+            graph LR
+                A[Draft Tokens] --> B[Target Logits]
+                B --> C{Accept?}
+                C -->|Yes| D[Accept Token]
+                C -->|No| E[Resample Token]
+                D --> F{All Accepted?}
+                F -->|Yes| G[Sample Bonus Token]
+                F -->|No| H[Output Accepted + Resampled]
+                G --> I[Output + Bonus]
+                E --> H
+            </div>
+
+            <h2>核心算法</h2>
+            <div class="code-block">
+                <pre><code>┌─────────────────────────────────────────────────────────────────┐
+│                    Rejection Sampling                           │
+├─────────────────────────────────────────────────────────────────┤
+│  Input:                                                         │
+│  - draft_token_ids: [d1, d2, d3]  (draft model 生成)             │
+│  - target_logits:   [t1, t2, t3, t_bonus]  (target model 计算)   │
+│                                                                 │
+│  Process:                                                       │
+│  1. 对于每个 draft token di:                                    │
+│     - 计算 acceptance probability: p = min(1, target(di)/draft(di))  │
+│     - 以概率 p accept，否则 reject                              │
+│                                                                 │
+│  2. 如果 accept 所有 draft tokens:                              │
+│     - 从 target model 采样 1 个 bonus token                      │
+│     - 输出：[d1, d2, d3, bonus_token]                           │
+│                                                                 │
+│  3. 如果 reject 在第 k 个 token:                                │
+│     - 从 adjusted distribution 采样 resampled token            │
+│     - 输出：[d1, d2, ..., d(k-1), resampled_token]              │
+│                                                                 │
+│  Output:                                                        │
+│  - sampled_token_ids: shape (batch_size, num_accepted + 1)      │
+│    例如：[[d1, d2, r1], [d1', d2', d3', r1'], ...]              │
+└─────────────────────────────────────────────────────────────────┘</code></pre>
+            </div>
+
+            <h2>核心代码</h2>
+            <p><strong>位置</strong>: <code>rejection_sampler.py:60-166</code></p>
+
+            <div class="code-block">
+                <pre><code class="language-python">class RejectionSampler(nn.Module):
+    def forward(
+        self,
+        metadata: SpecDecodeMetadata,
+        draft_probs: torch.Tensor | None,
+        logits: torch.Tensor,
+        sampling_metadata: SamplingMetadata,
+    ) -> SamplerOutput:
+        """
+        拒绝采样主流程：
+        1. 对 bonus token 采样
+        2. 应用 logits 处理器
+        3. 应用采样约束 (temperature, top-k, top-p)
+        4. 执行拒绝采样 kernel
+        5. 返回最终输出
+        """</code></pre>
+            </div>
+
+            <h2>Triton Kernels</h2>
+
+            <h3>Greedy Sampling Kernel</h3>
+            <div class="code-block">
+                <pre><code class="language-python">@triton.jit
+def rejection_greedy_sample_kernel(...):
+    """Greedy 采样的拒绝采样"""
+    # 比较 draft 和 target 的 argmax
+    # 如果相同则接受，否则拒绝</code></pre>
+            </div>
+
+            <h3>Random Sampling Kernel</h3>
+            <div class="code-block">
+                <pre><code class="language-python">@triton.jit
+def rejection_random_sample_kernel(...):
+    """Random 采样的拒绝采样"""
+    # 计算接受概率 P_target / P_draft
+    # 与均匀分布比较决定是否接受
+    # 如果拒绝，使用 recovered token</code></pre>
+            </div>
+
+            <h2>采样流程</h2>
+            <p><strong>位置</strong>: <code>model_runner_v1.py:1537-1556</code></p>
+
+            <div class="code-block">
+                <pre><code class="language-python">def _sample(self, logits, spec_decode_metadata):
+    sampling_metadata = self.input_batch.sampling_metadata
+
+    if spec_decode_metadata is None:
+        # 普通采样（无 spec decode）
+        return self.sampler(logits=logits, sampling_metadata=sampling_metadata)
+
+    # Spec decode 采样：验证 draft token
+    if lmhead_tp_enable() and logits is not None:
+        logits = logits[: len(spec_decode_metadata.logits_indices)]
+
+    sampler_output = self.rejection_sampler(
+        spec_decode_metadata,
+        None,  # draft_probs
+        logits,       # target model 的 logits [num_tokens + batch_size, vocab_size]
+        sampling_metadata,
+    )
+    return sampler_output</code></pre>
+            </div>
+
+            <h2>接受概率计算</h2>
+            <p>
+                对于每个草稿 token γ，接受概率的计算公式为：
+            </p>
+            <div class="code-block">
+                <pre><code>P(accept) = min(1, P_target(γ) / P_draft(γ))
+
+其中:
+- P_target(γ) 是目标模型生成 token γ 的概率
+- P_draft(γ) 是草稿模型生成 token γ 的概率
+
+如果 P_target(γ) ≥ P_draft(γ)，则必定接受
+如果 P_target(γ) < P_draft(γ)，则以概率 P_target(γ) / P_draft(γ) 接受</code></pre>
+            </div>
+
+            <h2>输出格式</h2>
+            <p>
+                RejectionSampler 的输出是一个 <code>SamplerOutput</code>，包含：
+            </p>
+            <ul>
+                <li><code>sampled_token_ids</code>: shape (batch_size, num_accepted + 1)</li>
+                <li>每个请求的输出包含接受的 draft tokens + 1 个新 token（bonus 或 resampled）</li>
+            </ul>
+
+            <div class="chapter-nav">
+                <a href="04-scheduler.html" class="prev-chapter">← 上一章</a>
+                <a href="06-draft-propose.html" class="next-chapter">
+                    <span class="nav-label">下一章</span>
+                    <span class="nav-title">Draft Token 生成 →</span>
+                </a>
+            </div>
+        </main>
+    </div>
+
+    <script>
+        hljs.highlightAll();
+        mermaid.initialize({
+            startOnLoad: true,
+            theme: 'dark',
+            themeVariables: {
+                darkMode: true,
+                background: '#161b22',
+                primaryColor: '#58a6ff',
+                primaryTextColor: '#c9d1d9',
+                primaryBorderColor: '#30363d',
+                lineColor: '#8b949e',
+                secondaryColor: '#21262d',
+                tertiaryColor: '#161b22'
+            }
+        });
+    </script>
+</body>
+</html>

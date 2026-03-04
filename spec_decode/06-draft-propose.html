@@ -1,0 +1,205 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Draft Token 生成 - Speculative Decoding</title>
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/styles/github-dark.min.css">
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/highlight.min.js"></script>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/languages/python.min.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/mermaid@10/dist/mermaid.min.js"></script>
+    <link rel="stylesheet" href="../styles.css">
+</head>
+<body>
+    <div class="container">
+        <nav class="sidebar">
+            <a href="../index.html" class="back-to-home">← 返回主页</a>
+            <div class="sidebar-header">
+                <h1>Speculative Decoding</h1>
+                <p>推测解码技术详解</p>
+            </div>
+            <div class="nav-section">
+                <div class="nav-section-title">文档目录</div>
+                <a href="index.html" class="nav-item"><span class="nav-item-number">00</span>概述</a>
+                <a href="01-architecture.html" class="nav-item"><span class="nav-item-number">01</span>架构设计</a>
+                <a href="02-methods.html" class="nav-item"><span class="nav-item-number">02</span>支持的方法</a>
+                <a href="03-token-flow.html" class="nav-item"><span class="nav-item-number">03</span>Token 生成与传递</a>
+                <a href="04-scheduler.html" class="nav-item"><span class="nav-item-number">04</span>Scheduler 调度</a>
+                <a href="05-rejection-sample.html" class="nav-item"><span class="nav-item-number">05</span>拒绝采样</a>
+                <a href="06-draft-propose.html" class="nav-item active"><span class="nav-item-number">06</span>Draft Token 生成</a>
+                <a href="07-config.html" class="nav-item"><span class="nav-item-number">07</span>配置参数</a>
+                <a href="08-summary.html" class="nav-item"><span class="nav-item-number">08</span>流程总结</a>
+            </div>
+        </nav>
+
+        <main class="main-content">
+            <h1>Draft Token 生成</h1>
+
+            <h2>概述</h2>
+            <p>
+                Draft Proposer 负责生成下一轮的草稿 token。在 RejectionSampler 输出采样的 token 后，
+                Proposer 使用 target model 的 hidden states 和 sampled tokens 作为输入，
+                快速生成多个候选 token 供下一轮验证。
+            </p>
+
+            <h2>Propose Draft Token IDs</h2>
+            <p><strong>位置</strong>: <code>model_runner_v1.py:1448-1495</code></p>
+
+            <div class="code-block">
+                <pre><code class="language-python">def propose_draft_token_ids(sampled_token_ids):
+    assert spec_decode_common_attn_metadata is not None
+    self._draft_token_ids = self.propose_draft_token_ids(
+        sampled_token_ids,              # 刚采样的 tokens（accepted + 1 个新 token）
+        self.input_batch.sampling_metadata,
+        scheduler_output,
+        spec_decode_metadata,
+        spec_decode_common_attn_metadata,
+        positions,
+        scheduler_output.total_num_scheduled_tokens,
+        hidden_states,                  # target model 的 hidden states
+        attn_metadata,
+        aux_hidden_states,
+        sample_hidden_states,
+    )
+    self._copy_draft_token_ids_to_cpu(scheduler_output)</code></pre>
+            </div>
+
+            <h2>策略选择</h2>
+            <p>
+                根据 speculative decoding 类型选择不同的策略：
+            </p>
+            <div class="code-block">
+                <pre><code class="language-python"># 根据 speculative decoding 类型选择不同策略
+with record_function_or_nullcontext("draft_token"):
+    if self.speculative_config:
+        use_padded_batch_for_eagle = (
+            self.speculative_config
+            and self.speculative_config.use_eagle()
+            and not self.speculative_config.disable_padded_drafter_batch
+        )
+        if use_padded_batch_for_eagle:
+            # EAGLE 可以使用 GPU sampled tokens，无需等待 bookkeeping 完成
+            propose_draft_token_ids(sampler_output.sampled_token_ids)
+        if self.speculative_config and not use_padded_batch_for_eagle:
+            # ngram 和其他方法使用 CPU sampled tokens
+            propose_draft_token_ids(valid_sampled_token_ids)</code></pre>
+            </div>
+
+            <h2>EAGLE Draft Model 前向传播</h2>
+            <p><strong>位置</strong>: <code>eagle_proposer.py:427-671</code></p>
+
+            <div class="code-block">
+                <pre><code class="language-python">def _propose(
+    self,
+    target_token_ids: torch.Tensor,      # target model 的输入 tokens
+    target_positions: torch.Tensor,      # 位置信息
+    target_hidden_states: torch.Tensor,  # ← 来自 target model 的 hidden states
+    next_token_ids: torch.Tensor,        # ← 上一轮采样的 tokens
+    last_token_indices: torch.Tensor,    # 每个 request 的最后一个 token 索引
+    common_attn_metadata: AscendCommonAttentionMetadata,
+    sampling_metadata: SamplingMetadata,
+    req_scheduled_tokens: dict[str, int],
+    num_scheduled_tokens: int,
+) -> list[list[int]]:
+    """
+    EAGLE 方法生成下一轮的 draft tokens
+    """
+    num_tokens = target_token_ids.shape[0]
+
+    # 1. 设置输入（使用 buffer 避免重复分配）
+    self.input_ids[:num_tokens] = target_token_ids
+    self.hidden_states[:num_tokens] = target_hidden_states
+
+    # 2. 构建注意力元数据
+    # 对于多步 speculative decoding，需要为每一步构建 attn_metadata
+    multi_steps_attn_metadata = [...]
+
+    # 3. Draft Model 多步前向传播
+    # _run_merged_draft 一次性生成所有 draft tokens
+    draft_token_ids = self._runnable(
+        num_input_tokens=num_input_tokens,
+        batch_size=batch_size,
+        last_token_indices=last_token_indices,
+        target_positions=target_positions,
+        inputs_embeds=inputs_embeds,
+        multi_steps_attn_metadata=multi_steps_attn_metadata,
+        ...
+    )
+    # draft_token_ids shape: (batch_size, num_spec_tokens)
+
+    # 4. 返回 draft tokens 列表
+    # 例如：[[d1', d2', d3'], [d1'', d2'', d3''], ...]
+    return draft_token_ids.cpu().tolist()</code></pre>
+            </div>
+
+            <h2>Hidden States 复用</h2>
+            <p>
+                EAGLE 方法的关键优化是复用 target model 的 hidden states，避免重复计算：
+            </p>
+            <div class="code-block">
+                <pre><code class="language-python"># 1. 从 target model 获取 hidden states
+target_hidden = target_model(input_ids)
+
+# 2. Draft model 使用 target hidden states 作为输入
+for i in range(num_spec_tokens):
+    draft_logits = draft_head(target_hidden)
+    draft_token = draft_logits.argmax()
+    draft_tokens.append(draft_token)</code></pre>
+            </div>
+
+            <h2>ACL Graph 支持</h2>
+            <p>
+                vllm-ascend 为 EAGLE 方法提供了 ACL Graph 支持，通过捕获和重放提高推理性能：
+            </p>
+            <ul>
+                <li>为 draft model 单独管理 attention metadata</li>
+                <li>支持多步 speculative decoding 的图捕获</li>
+                <li>优化了 GPU 内存使用</li>
+            </ul>
+
+            <h2>输出格式</h2>
+            <p>
+                Draft Proposer 的输出是 <code>DraftTokenIds</code> 格式：
+            </p>
+            <div class="code-block">
+                <pre><code class="language-python">class DraftTokenIds:
+    req_ids: list[str]                    # 请求 ID 列表
+    draft_token_ids: list[list[int]]      # 每个请求的 draft tokens
+
+# 例如：
+# req_ids = ["req_1", "req_2"]
+# draft_token_ids = [[d1, d2, d3], [d1', d2', d3']]
+
+# 通过 _copy_draft_token_ids_to_cpu 复制到 scheduler
+request.spec_token_ids = [d1, d2, d3]</code></pre>
+            </div>
+
+            <div class="chapter-nav">
+                <a href="05-rejection-sample.html" class="prev-chapter">← 上一章</a>
+                <a href="07-config.html" class="next-chapter">
+                    <span class="nav-label">下一章</span>
+                    <span class="nav-title">配置参数 →</span>
+                </a>
+            </div>
+        </main>
+    </div>
+
+    <script>
+        hljs.highlightAll();
+        mermaid.initialize({
+            startOnLoad: true,
+            theme: 'dark',
+            themeVariables: {
+                darkMode: true,
+                background: '#161b22',
+                primaryColor: '#58a6ff',
+                primaryTextColor: '#c9d1d9',
+                primaryBorderColor: '#30363d',
+                lineColor: '#8b949e',
+                secondaryColor: '#21262d',
+                tertiaryColor: '#161b22'
+            }
+        });
+    </script>
+</body>
+</html>
